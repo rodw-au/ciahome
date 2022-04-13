@@ -119,14 +119,58 @@ typedef enum {
 
 static int  immediate_state;
 
+
 //local data
+//CIA Control Word
+typedef union
+{
+  struct
+  {
+    unsigned char SwitchOn        : 1;  // 00
+    unsigned char EnableVoltage   : 1;  // 01
+    unsigned char QuickStop       : 1;  // 02
+    unsigned char EnableOperation : 1;  // 03
+    unsigned char StartHome       : 1;  // 04 not used in CSP or homing
+    unsigned char bit5            : 1;  // 05 not used in CSP or homing
+    unsigned char bit6            : 1;  // 06 not used in CSP or homing
+    unsigned char Faultreset      : 1;  // 07
+    unsigned char Timeout         : 1;  // 08
+    unsigned char bit9            : 1;  // 09 not used in any mode
+    unsigned char keep            : 6;  // 10-15 not used in any mode
+  }b;
+    unsigned int Word;
+}Control_t;
+
+//CIA Status Word
+typedef union
+{
+  struct
+  {
+    unsigned char ReadyToSwitchOn  : 1;  // 00
+    unsigned char SwitchOn         : 1;  // 01
+    unsigned char OperationEnabled : 1;  // 02
+    unsigned char Fault            : 1;  // 03
+    unsigned char VoltageEnabled   : 1;  // 04
+    unsigned char QuickStop        : 1;  // 05
+    unsigned char SwitchOnDisabled : 1;  // 06
+    unsigned char Warning          : 1;  // 07
+    unsigned char keep1            : 1;  // 08
+    unsigned char Remote           : 1;  // 09
+    unsigned char TargetReached    : 1;  // 10
+    unsigned char bit11            : 1;  // 11
+    unsigned char bit12            : 1;  // 12
+    unsigned char keep2            : 3;  // 13-15
+  }b;
+    hal_u32_t Word;
+}Status_t;
+
 typedef struct {
-    hal_bit_t home_sw;      // home switch input
-    hal_bit_t homing;       // joint is homing
-    hal_bit_t homed;        // joint was homed
-    hal_bit_t home;         // joint home
-    hal_bit_t index_enable; // motmod sets: request reset on index, encoder clears: index arrived
-    home_state_t home_state;   // homing state machine state
+    hal_bit_t home_sw;       // home switch input
+    hal_bit_t homing;          // *joint is homing
+    hal_bit_t homed;           // *joint was homed
+    hal_bit_t home;            // joint home
+    hal_bit_t index_enable;  // motmod sets: request reset on index, encoder clears: index arrived
+    home_state_t home_state;   // *homing state machine state
     bool home_is_synchronized;
 	int home_sequence;
 	bool volatile_home;
@@ -134,6 +178,33 @@ typedef struct {
 	bool sync_final_move;
 	int home_flags;
 	double home_offset;
+	
+	// CIA402 pins
+	hal_u32_t statusword;       // IN  - Drives CiA402 Statusword, index 0x6041
+	signed opmode_display;      // IN  - Drives Modes of Operation feedback register, index 0x6061
+	signed drv_actual_position; // IN  - Drives actual Position, index 0x6064
+	signed drv_actual_velocity; // IN  - Drives actual Velocity, index 0x606C 
+	unsigned controlword;       // OUT - Drives CIA402 Controlword, index 0x6040
+	signed opmode;              // OUT - Drives Modes of Operation Input, index 0x6060
+	signed drv_target_position; // OUT - Position command to the drive, index 0x607A
+	signed drv_target_velocity; // OUT - Velocity command to the drive, index 0x60FF
+	
+	// Control IOs
+	hal_bit_t enable;     		// IN - true enables the Drive
+	float pos_cmd;  			// IN - target Position, from Motion or PID
+	float velocity_cmd;         // IN - target Velocity, from Motion or PID
+
+    float pos_fb;               // OUT - Position feedback, scaled
+    float velocity_fb;          // OUT - Velocity feedback scaled
+    hal_bit_t drv_fault;        // OUT - true indicates an Drive Error
+    
+    //Homing IOs
+    hal_bit_t cia_home;        	// IO  - true starts the Drives internal home procedure
+	hal_bit_t stat_homed;  		// OUT - true indicates that the Drive is internaly homed
+	hal_bit_t stat_homing; 		// OUT - true indicates that the Drives homing procedure is running
+
+    Status_t     Status;  		// IN  - CIA Status Word with bitmap (not a pin)
+    Control_t    Control; 		// OUT - CIA Control Word with bitmap (not a pin)
     
     hal_s32_t tperiod;      // period dummy pin that counts the periods
 } home_local_data_t;
@@ -142,12 +213,12 @@ static  home_local_data_t H[EMCMOT_MAX_JOINTS];
 // data for per-joint homing-specific hal pins:
 typedef struct {
     hal_bit_t *home_sw;      // home switch input
-    hal_bit_t *homing;       // joint is homing
-    hal_bit_t *homed;        // joint was homed
+    hal_bit_t *homing;         // joint is homing
+    hal_bit_t *homed;          // joint was homed
     hal_bit_t *index_enable; // motmod sets: request reset on index, encoder clears: index arrived
-    hal_s32_t *home_state;   // homing state machine state
+    hal_s32_t *home_state;     // homing state machine state
     
-    hal_s32_t *tperiod;      // period dummy pin that counts the periods
+    hal_s32_t *tperiod;        // period dummy pin that counts the periods
     hal_bit_t *home_is_synchronized;
 	hal_s32_t *home_sequence;
 	hal_bit_t *volatile_home;
@@ -155,8 +226,33 @@ typedef struct {
 	hal_bit_t *sync_final_move;
 	hal_s32_t *home_flags;
 	double    *home_offset;
+	//unsigned  *statusword;
+	hal_u32_t *statusword;       // IN  - Drives CiA402 Statusword, index 0x6041
+	signed *opmode_display;      // IN  - Drives Modes of Operation feedback register, index 0x6061
+	signed *drv_actual_position; // IN  - Drives actual Position, index 0x6064
+	signed *drv_actual_velocity; // IN  - Drives actual Velocity, index 0x606C 
+	unsigned *controlword;       // OUT - Drives CIA402 Controlword, index 0x6040
+	signed *opmode;              // OUT - Drives Modes of Operation Input, index 0x6060
+	signed *drv_target_position; // OUT - Position command to the drive, index 0x607A
+	signed *drv_target_velocity; // OUT - Velocity command to the drive, index 0x60FF
+	
+	// Control IOs
+	hal_bit_t *cia_enable;   		 // IN - true enables the Drive
+	float *cia-pos_cmd;  			 // IN - target Position, from Motion or PID
+	float *cia-velocity_cmd;         // IN - target Velocity, from Motion or PID
 
+    float *cia-pos_fb;               // OUT - Position feedback, scaled
+    float *cia-velocity_fb;          // OUT - Velocity feedback scaled
+    hal_bit_t *cia-drv_fault;        // OUT - true indicates an Drive Error
+    
+    //Homing IOs
+    hal_bit_t *cia_home;   		 // IO  - true starts the Drives internal home procedure
+	hal_bit_t *stat_homed; 		 // OUT - true indicates that the Drive is internaly homed
+	hal_bit_t *stat_homing;		 // OUT - true indicates that the Drives homing procedure is running
+	
 } one_joint_home_data_t;
+
+
 
 typedef struct {
     one_joint_home_data_t jhd[EMCMOT_MAX_JOINTS];
@@ -191,7 +287,38 @@ static int makepins(int id,int njoints)
         retval += hal_pin_bit_newf(HAL_IO, &(addr->index_enable), id,
                                   "joint.%d.index-enable", jno);
         retval += hal_pin_s32_newf(HAL_OUT, &(addr->tperiod), id,
-                                  "joint.%d.cia-period", jno);                           
+                                  "joint.%d.cia-period", jno);  
+        retval += hal_pin_u32_newf(HAL_IN, &(addr->statusword), id,
+                                  "joint.%d.cia-statusword", jno);
+        retval += hal_pin_s32_newf(HAL_IN, (volatile int **)&(addr->opmode_display), id,
+                                  "joint.%d.cia-opmode-display", jno);
+        retval += hal_pin_s32_newf(HAL_IN, (volatile int **)&(addr->drv_actual_position), id,
+                                  "joint.%d.cia-drv-actual_position", jno);
+       retval += hal_pin_s32_newf(HAL_IN, (volatile int **)&(addr->drv_actual_velocity), id,
+                                  "joint.%d.cia-drv-actual-velocity", jno);                                 
+        retval += hal_pin_u32_newf(HAL_OUT, (volatile unsigned int **)&(addr->controlword), id,
+                                  "joint.%d.cia-controlword", jno);
+        retval += hal_pin_s32_newf(HAL_OUT, (volatile int **)&(addr->opmode), id,
+                                  "joint.%d.cia-opmode", jno);
+        retval += hal_pin_s32_newf(HAL_OUT, (volatile  int **)&(addr->drv_target_position), id,
+                                  "joint.%d.cia-drv-target-position", jno);
+        retval += hal_pin_s32_newf(HAL_OUT, (volatile  int **)&(addr->drv_target_velocity), id,
+                                  "joint.%d.cia-drv-target-velocity", jno);   
+		retval += hal_pin_bit_newf(HAL_IN, &(addr->enable), id,
+                                  "joint.%d.cia-enable", jno);   
+		retval += hal_pin_float_newf(HAL_IN, &(addr->pos_cmd), id,
+                                  "joint.%d.cia-pos-cmd", jno);                                                                                                                       
+		retval += hal_pin_float_newf(HAL_IN, &(addr->velocity_cmd), id,
+                                  "joint.%d.cia-velocity-cmd", jno);                                                                                                                       
+		retval += hal_pin_float_newf(HAL_OUT, &(addr->pos_fb), id,
+                                  "joint.%d.cia-pos-fb", jno);                                                                                                                       
+		retval += hal_pin_float_newf(HAL_OUT, &(addr->velocity_fb), id,
+                                  "joint.%d.cia-velocity-cmd", jno);                                                                                                                       
+        retval += hal_pin_bit_newf(HAL_OUT, &(addr->drv_fault), id,
+                                  "joint.%d.cia-drv-fault", jno);
+        retval += hal_pin_bit_newf(HAL_IO, &(addr->cia_home), id,
+                                  "joint.%d.cia-home", jno);
+
     }
     return retval;
 }
@@ -396,8 +523,10 @@ void read_homing_in_pins(int njoints)
   one_joint_home_data_t *addr;
   for (jno = 0; jno < njoints; jno++) {
     addr = &(joint_home_data->jhd[jno]);
-	H[jno].home_sw      = *(addr->home_sw);      // IN
-    H[jno].index_enable = *(addr->index_enable); // IO    
+	//H[jno].home_sw      = *(addr->home_sw);      // IN
+    //H[jno].index_enable = *(addr->index_enable); // IO
+    H[jno].statusword = *(addr->statusword);     // IN    
+    H[jno].Status.Word = H[jno].statusword;      // Save status to bitmapped struct
   }
   return;
 }
