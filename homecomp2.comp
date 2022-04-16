@@ -342,9 +342,9 @@ static int makepins(int id,int njoints)
                                   "joint.%d.cia-drv-fault", jno);
         retval += hal_pin_bit_newf(HAL_IO, &(addr->cia_home), id,
                                   "joint.%d.cia-home", jno);
-        retval += hal_pin_bit_newf(HAL_IO, &(addr->stat_homed), id,
+        retval += hal_pin_bit_newf(HAL_OUT, &(addr->stat_homed), id,
                                   "joint.%d.cia-stat-homed", jno);
-        retval += hal_pin_bit_newf(HAL_IO, &(addr->stat_homing), id,
+        retval += hal_pin_bit_newf(HAL_OUT, &(addr->stat_homing), id,
                                   "joint.%d.cia-stat-homing", jno);
 
     }
