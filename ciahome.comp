@@ -1,4 +1,4 @@
-component ciahome "Ethercat cia402 homing module";
+component homecomp1"homing module template";
 
 description """
 Example of a homing module buildable with halcompile.
@@ -27,15 +27,7 @@ or by inifile setting: \\fB[EMCMOT]HOMEMOD=user_homecomp\\fR
 2) This source file for BRANCHNAME (master,2.9,etc) is downloadable from github:\n
 https://github.com/LinuxCNC/linuxcnc/blob/BRANCHNAME/src/hal/components/homecomp.comp
 """;
-/*
-cia402 Homing mode and homing parameters are defined and configured in your ethercat config.xml file per this example
-  <sdoConfig idx="6098" subIdx="0"><sdoDataRaw data ="11 00"/></sdoConfig>  <!-- Home mode 17 -->
-  <sdoConfig idx="607C" subIdx="0"><sdoDataRaw data ="00 00"/></sdoConfig>  <!-- Home offset 0  -->
-  <sdoConfig idx="609A" subIdx="0"><sdoDataRaw data ="F4 01"/></sdoConfig>  <!-- Home accelleration 500 -->
-  <sdoConfig idx="6099" subIdx="01"><sdoDataRaw data ="C4 09"/></sdoConfig>  <!-- Home fast speed 2500-->
-  <sdoConfig idx="6099" subIdx="02"><sdoDataRaw data ="F4 01"/></sdoConfig>  <!-- Home slow speed 500 -->
 
-*/
 pin out bit is_module=1; //one pin is required to use halcompile)
 
 license "GPL";
@@ -45,13 +37,64 @@ option  extra_setup;
 
 #include "motion.h"
 #include "homing.h"
-#include "hal.h"
-#include "rtapi.h"
-#include "rtapi_math.h"
-#include "time.h"
-#include <stdint.h>
+#include "math.h"
+#define ABS(x) (((x) < 0) ? -(x) : (x))
+#define MAX_HOME_SEQUENCES EMCMOT_MAX_JOINTS
+/* Length of delay between homing motions - this is intended to
+   ensure that all motion has ceased and switch bouncing has
+   ended.  We might want to make this user adjustable, but for
+   now it's a constant.  It is in seconds */
+#define HOME_DELAY 0.100
+static char *home_parms;
+RTAPI_MP_STRING(home_parms,"Example home parms");
 
-#pragma GCC diagnostic ignored "-Wincompatible-pointer-types"
+// rtapi_app_main() supplied by halcompile
+// EXTRA_SETUP is executed before rtapi_app_main()
+EXTRA_SETUP() {
+    if (!home_parms) {home_parms = "no_home_parms";}
+    rtapi_print("@@@%s:%s: home_parms=%s\n",__FILE__,__FUNCTION__,home_parms);
+    return 0;
+}
+
+// retrieved from motmod.so:
+static emcmot_joint_t  *joints;
+static int all_joints;
+static int extra_joints;
+static double servo_freq;
+
+//========================================================
+// motmod function ptrs for functions called BY homecomp:
+static void(*SetRotaryUnlock)(int,int);
+static int (*GetRotaryIsUnlocked)(int);
+
+//========================================================
+// functions ptrs received from motmod:
+void homeMotFunctions(void(*pSetRotaryUnlock)(int,int)
+                     ,int (*pGetRotaryIsUnlocked)(int)
+                     )
+{
+    SetRotaryUnlock     = *pSetRotaryUnlock;
+    GetRotaryIsUnlocked = *pGetRotaryIsUnlocked;
+}
+
+//========================================================
+
+// internal SEQUENCE states
+typedef enum {
+  HOME_SEQUENCE_IDLE = 0,        // valid start state
+  HOME_SEQUENCE_START,           // valid start state
+  HOME_SEQUENCE_DO_ONE_JOINT,    // valid start state
+  HOME_SEQUENCE_DO_ONE_SEQUENCE, // valid start state
+  HOME_SEQUENCE_START_JOINTS,    // internal usage
+  HOME_SEQUENCE_WAIT_JOINTS,     // internal usage
+} home_sequence_state_t;
+
+// home sequences (some states are required)
+static home_sequence_state_t sequence_state;
+static int  home_sequence = -1;
+static bool homing_active;
+
+/* internal states for homing */
 typedef enum {
   HOME_IDLE = 0,
   HOME_START,// 1
@@ -78,79 +121,17 @@ typedef enum {
   HOME_LOCK,// 22
   HOME_LOCK_WAIT,// 23
   HOME_FINISHED,// 24
-  HOME_ABORT// 25
+  HOME_ABORT,// 25
+  HOME_CIA402_START,   //26 - new - start homing
+  HOME_CIA402_CONFIRM, //27 - new - wait for homing mode to be confirmed 
+  HOME_CIA402_WAIT     //28  - new - wait until homing mode is completed  
 } home_state_t;
 
-//CiA IOs
+static int  immediate_state;
 
-//constants
-#define FAULT_AUTORESET_DELAY_NS 100000000LL
-#define OPMODE_CYCLIC_POSITION 8
-#define OPMODE_CYCLIC_VELOCITY 9
-#define OPMODE_HOMING 6
-#define OPMODE_NONE 0
-#define HEARTBEAT 0.25
-#define DEBUG
 
-typedef  enum HOME_STATE{HOME_TRIGGER, HOME_CONFIRM, HOME_SEEKING} cia_home_state_t   ;  // For cia
-
-/*
-inputs from drive
------------------
-pin in unsigned statusword        "Drives CiA402 Statusword, index 0x6041";
-pin in signed opmode_display      "Drives Modes of Operation feedback register, index 0x6061";
-pin in signed drv_actual_position "Drives actual Position, index 0x6064";
-pin in signed drv_actual_velocity "Drives actual Velocity, index 0x606C";
-
-outputs to drive
-----------------
-pin out unsigned controlword    "Drives CIA402 Controlword, index 0x6040";
-pin out signed opmode           "Drives Modes of Operation Input, index 0x6060";
-pin out signed drv_target_position  "Position command to the drive, index 0x607A";
-pin out signed drv_target_velocity  "Velocity command to the drive, index 0x60FF";
-
-Control IOs
------------
-pin in bit enable     "true enables the Drive";
-pin in float pos_cmd  "target Position, from Motion or PID";
-pin in float velocity_cmd "target Velocity, from Motion or PID";
-
-pin out float pos_fb      "Position feedback, scaled";
-pin out float velocity_fb "Velocity feedback scaled";
-pin out bit drv_fault     "true indicates an Drive Error";
-Homing IOs
-----------
-pin io bit home         "true starts the Drives internal home procedure, connect this to joint.x.index-enable pin";
-pin out bit stat_homed  "true indicates that the Drive is internaly homed";
-pin out bit stat_homing "true indicates that the Drives homing procedure is running";
-Auxilary IOs
-------------
-pin out bit stat_switchon_ready   "Drive in CiA State: ready to switch on";
-pin out bit stat_switched_on      "Drive in CiA State: switched on";
-pin out bit stat_op_enabled       "Drive in CiA State: Operation enabled";
-pin out bit stat_voltage_enabled  "Drive in CiA State: switched on, Voltage enabled";
-pin out bit stat_fault            "Drive hast the fault bit set";
-pin out bit stat_quick_stop       "Drive in State: Quick Stop";
-pin out bit stat_switchon_disabled  "Drive in CiA State: Switch on disabled";
-pin out bit stat_warning          "Drive has the warning bit set";
-pin out bit stat_remote           "Drive in State remote / bus operation";
-pin out bit stat_target_reached   "Drive has reached target position / velocity";
-pin out bit opmode_no_mode        "Drive has no operation Mode set";
-pin out bit opmode_homing         "Drive in Mode Homing";
-pin out bit opmode_cyclic_position  "Drive in Mode Cyclic synchronus Position";
-pin out bit opmode_cyclic_velocity  "Drive in Mode Cyclic synchronus Velocity";
-
-pin in bit fault_reset  "true, sends fault reset command to the Drive";
-
-parameters
-----------
-param rw float pos_scale    "increments per machine unit";
-param rw float velo_scale   "velocity in machine units per 1 Motor revolution";
-param rw bit auto_fault_reset "true resets an actual Drive Fault automatically at the next enable Signal";
-param rw bit csp_mode "true= CS Position Mode, false= CS Velocity Mode, is only recognized at Linuxcnc Startup, default true";
-
-*/
-
+//local data
+//CIA Control Word
 typedef union
 {
   struct
@@ -170,6 +151,7 @@ typedef union
     unsigned int Word;
 }Control_t;
 
+//CIA Status Word
 typedef union
 {
   struct
@@ -189,418 +171,111 @@ typedef union
     unsigned char bit12            : 1;  // 12
     unsigned char keep2            : 3;  // 13-15
   }b;
-  unsigned int Word;
+    hal_u32_t Word;
 }Status_t;
 
-
 typedef struct {
-  bool         homing;               // OUT pin
-  bool         homed;                // OUT pin
-  bool         home_sw;              // IN  pin
-  bool         index_enable;         // IO  pin
-  bool         at_home;
-  bool         sync_final_move;      // joints with neg sequence
-  bool         joint_in_sequence;
-  int          pause_timer;
-  double       home_offset;          // intfc, updateable
-  double       home;                 // intfc, updateable
-  double       home_final_vel;       // intfc
-  double       home_search_vel;      // intfc
-  double       home_latch_vel;       // intfc
-  int          home_flags;           // intfc
-  int          home_sequence;        // intfc, updateable
-  bool         volatile_home;        // intfc
-  bool         home_is_synchronized;
-  double       cia_control;
-  double       cia_status;
-  unsigned int opmode_display;
-  unsigned int drv_actual_position;
-  unsigned int drv_actual_velocity;
-  unsigned int drv_target_position;
-  unsigned int drv_target_velocity;
-  bool         drv_fault;
-  float        pos_cmd;
-  float        vel_cmd;
-  unsigned int enable;
-  bool         enable_old;
-  unsigned int target_pos;
-  unsigned int target_vel;
-  unsigned int pos_fb;
-  unsigned int velocity_fb;
-  unsigned int opmode;
-  bool         start_homing;
-  bool         stat_homed;
-  bool         stat_homed_old;
-  bool         stat_homing;
-  float        pos_scale;
-  float        vel_scale;
-  bool         auto_fault_reset;
-  bool         csp_mode; // = 1;
-  bool         stat_switchon_ready;
-  bool         stat_switched_on;
-  bool         stat_op_enabled;
-  bool         stat_voltage_enabled;
-  bool         stat_fault;
-  bool         stat_quick_stop;
-  bool         stat_switchon_disabled;
-  bool         stat_warning;
-  bool         stat_remote;
-  bool         stat_target_reached;
-  bool         opmode_no_mode;
-  bool         opmode_homing;
-  bool         opmode_cyclic_position;
-  bool         opmode_cyclic_velocity;
-  float        pos_scale_rcpt;
-  float        velo_scale_old;
-  float        pos_scale_old;
-  float        velo_scale_rcpt;
-  bool         init_pos;
-  bool         pos_mode;
-  bool         init_pos_mode;
-  bool         fault_reset;
-  bool         auto_fault_reset_delay;
-  cia_home_state_t home_state;
-  Status_t     Status;
-  Control_t    Control;
-#ifdef DEBUG
-  bool         heartbeat;
-#endif
-} home_local_data;
+    hal_bit_t home_sw;       // home switch input
+    hal_bit_t homing;          // *joint is homing
+    hal_bit_t homed;           // *joint was homed
+    hal_bit_t home;            // joint home
+    hal_bit_t index_enable;  // motmod sets: request reset on index, encoder clears: index arrived
+    home_state_t home_state;   // *homing state machine state
+    bool home_is_synchronized;
+	int home_sequence;
+	bool volatile_home;
+	bool joint_in_sequence;
+	bool sync_final_move;
+	int home_flags;
+	double home_offset;
+	
+	// CIA402 pins
+	hal_u32_t statusword;       // IN  - Drives CiA402 Statusword, index 0x6041
+	signed opmode_display;      // IN  - Drives Modes of Operation feedback register, index 0x6061
+	signed drv_actual_position; // IN  - Drives actual Position, index 0x6064
+	signed drv_actual_velocity; // IN  - Drives actual Velocity, index 0x606C 
+	unsigned controlword;       // OUT - Drives CIA402 Controlword, index 0x6040
+	signed opmode;              // OUT - Drives Modes of Operation Input, index 0x6060
+	signed drv_target_position; // OUT - Position command to the drive, index 0x607A
+	signed drv_target_velocity; // OUT - Velocity command to the drive, index 0x60FF
+	
+	// Control IOs
+	hal_bit_t enable;     		// IN - true enables the Drive
+	float pos_cmd;  			// IN - target Position, from Motion or PID
+	float velocity_cmd;         // IN - target Velocity, from Motion or PID
 
-enum opmode{PositionMode = 1, VelocityMode = 3, HomeMode = 6, DynamicMode = 8};
+    float pos_fb;               // OUT - Position feedback, scaled
+    float velocity_fb;          // OUT - Velocity feedback scaled
+    hal_bit_t drv_fault;        // OUT - true indicates an Drive Error
+    
+    //Homing IOs
+    hal_bit_t cia_home;        	// IO  - true starts the Drives internal home procedure
+	hal_bit_t stat_homed;  		// OUT - true indicates that the Drive is internaly homed
+	hal_bit_t stat_homing; 		// OUT - true indicates that the Drives homing procedure is running
 
-static clock_t last_time = 0;
-static float   last_f_period = 0;
-static  home_local_data H[EMCMOT_MAX_JOINTS];
-static char *home_parms;
-RTAPI_MP_STRING(home_parms,"CIA402 home parms");
+    Status_t     Status;  		// IN  - CIA Status Word with bitmap (not a pin)
+    Control_t    Control; 		// OUT - CIA Control Word with bitmap (not a pin)
+    
+    // Inluded for compatibility with homing.c
+    int pause_timer;
+    double       home_final_vel;       // intfc
+    double       home_search_vel;      // intfc
+    double       home_latch_vel;       // intfc
+    
+    // Test pins - to delete
+    hal_s32_t tperiod;      // period dummy pin that counts the periods
+} home_local_data_t;
+static  home_local_data_t H[EMCMOT_MAX_JOINTS];
 
 // data for per-joint homing-specific hal pins:
 typedef struct {
-    hal_bit_t *home_sw;            // home switch input
-    hal_bit_t *homing;             // joint is homing
-    hal_bit_t *homed;              // joint is homed
-    hal_bit_t *index_enable;       // motmod sets: request reset on index
-                                   //        encoder clears: index arrived
-    // cia402 homing
-    hal_bit_t *csp_mode;           // true= CS Position Mode, false= CS Velocity Mode, is only recognized at Linuxcnc Startup
-    hal_u32_t *cia_control;        // 0x6040 cia402 control word
-    hal_u32_t *cia_status;         // 0x6041 cia402 status word
-    hal_s32_t *cia_target_pos;     // 0x607A cia402 Target Position
-    hal_s32_t *cia_target_vel;     // 0x60FF cia402 Target Velocity
-    hal_s32_t *cia_opmode;         // 0x6060 cia402 opmode
-    hal_s32_t *cia_current_pos;    // 0x6064 0x6064 cia402 Current Position
-    hal_s32_t *cia_current_vel;    // 0x606C cia402 Current Velocity
-    hal_s32_t *cia_opmode_display; // 0x6061 cia402 Opmode Display
-    hal_s32_t *cia_drv_actual_position;
-    hal_s32_t *cia_drv_actual_velocity;
-    hal_s32_t *cia_enable;
-    float     *pos_cmd;
-    float     *vel_cmd;
-    hal_s32_t *cia_drv_target_position;
-    hal_s32_t *cia_drv_target_velocity;
-    bool      *drv_fault;
-    hal_s32_t *cia_pos_fb;
-    hal_s32_t *cia_velocity_fb;
-    hal_s32_t *cia_start_homing;
-    hal_bit_t *cia_stat_homed;
-    hal_bit_t *cia_stat_homed_old;
-    hal_bit_t *cia_stat_homing;
-    float     *cia_pos_scale;      // "increments per machine unit";
-    float     *cia_vel_scale;      //"velocity in machine units per 1 Motor revolution";
-    hal_bit_t *cia_auto_fault_reset;
-    hal_bit_t *cia_csp_mode;
-    hal_bit_t *stat_switchon_ready;
-    hal_bit_t *stat_switched_on;
-    hal_bit_t *stat_op_enabled;
-    hal_bit_t *stat_voltage_enabled;
-    hal_bit_t *stat_fault;
-    hal_bit_t *stat_quick_stop;
-    hal_bit_t *stat_switchon_disabled;
-    hal_bit_t *stat_warning;
-    hal_bit_t *stat_remote;
-    hal_bit_t *stat_target_reached;
-    hal_bit_t *opmode_no_mode;
-    hal_bit_t *opmode_homing;
-    hal_bit_t *opmode_cyclic_position;
-    hal_bit_t *opmode_cyclic_velocity;
-    float     *pos_scale_rcpt;
-    float     *velo_scale_old;
-    float     *pos_scale_old;
-    float     *velo_scale_rcpt;
-    bool      *init_pos;
-    bool      *pos_mode;
-    bool      *init_pos_mode;
-    cia_home_state_t *home_state;
-    bool      *fault_reset;
-    bool      *auto_fault_reset_delay;
-#ifdef DEBUG
-    bool      *heartbeat;
-#endif
+    hal_bit_t *home_sw;      // home switch input
+    hal_bit_t *homing;         // joint is homing
+    hal_bit_t *homed;          // joint was homed
+    hal_bit_t *index_enable; // motmod sets: request reset on index, encoder clears: index arrived
+    hal_s32_t *home_state;     // homing state machine state
+    
+    hal_s32_t *tperiod;        // period dummy pin that counts the periods
+    hal_bit_t *home_is_synchronized;
+	hal_s32_t *home_sequence;
+	hal_bit_t *volatile_home;
+	hal_bit_t *joint_in_sequence;
+	hal_bit_t *sync_final_move;
+	hal_s32_t *home_flags;
+	double    *home_offset;
+	//unsigned  *statusword;
+	hal_u32_t *statusword;       // IN  - Drives CiA402 Statusword, index 0x6041
+	signed *opmode_display;      // IN  - Drives Modes of Operation feedback register, index 0x6061
+	signed *drv_actual_position; // IN  - Drives actual Position, index 0x6064
+	signed *drv_actual_velocity; // IN  - Drives actual Velocity, index 0x606C 
+	unsigned *controlword;       // OUT - Drives CIA402 Controlword, index 0x6040
+	signed *opmode;              // OUT - Drives Modes of Operation Input, index 0x6060
+	signed *drv_target_position; // OUT - Position command to the drive, index 0x607A
+	signed *drv_target_velocity; // OUT - Velocity command to the drive, index 0x60FF
+	
+	// Control IOs
+	hal_bit_t *cia_enable;   	// IN - true enables the Drive
+	float *cia_pos_cmd;  		// IN - target Position, from Motion or PID
+	float *cia_velocity_cmd;    // IN - target Velocity, from Motion or PID
 
+    float *cia_pos_fb;          // OUT - Position feedback, scaled
+    float *cia_velocity_fb;     // OUT - Velocity feedback scaled
+    hal_bit_t *cia_drv_fault;   // OUT - true indicates an Drive Error
+    
+    //Homing IOs
+    hal_bit_t *cia_home;   		// IO  - true starts the Drives internal home procedure
+	hal_bit_t *stat_homed; 		// OUT - true indicates that the Drive is internaly homed
+	hal_bit_t *stat_homing;		// OUT - true indicates that the Drives homing procedure is running
+	
 } one_joint_home_data_t;
+
+
 
 typedef struct {
     one_joint_home_data_t jhd[EMCMOT_MAX_JOINTS];
 } all_joints_home_data_t;
 
 static all_joints_home_data_t *joint_home_data = 0;
-
-
-// rtapi_app_main() supplied by halcompile
-// EXTRA_SETUP is executed before rtapi_app_main()
-EXTRA_SETUP() {
-    int jno;
-    if (!home_parms) {home_parms = "no_home_parms";}
-    rtapi_print("@@@%s:%s: home_parms=%s\n",__FILE__,__FUNCTION__,home_parms);
-
-    for(jno =0;jno  < EMCMOT_MAX_JOINTS; jno++){
-       //cia402 initialize variables
-       H[jno].pos_scale = 1.0;
-       H[jno].pos_scale_old = H[jno].pos_scale + 1.0;
-       H[jno].pos_scale_rcpt = 1.0;
-       H[jno].vel_scale = 1.0;
-       H[jno].velo_scale_old = H[jno].vel_scale + 1.0;
-       H[jno].velo_scale_rcpt = 1.0;
-       H[jno].auto_fault_reset = 1;
-       H[jno].csp_mode = 1;
-       H[jno].home_state = HOME_TRIGGER;
-       return 0;
-    }
-    if (last_time == 0)
-        last_time = clock();
-}
-
-// retrieved from motmod.so:
-static emcmot_config_t *emcmotConfig;
-static emcmot_joint_t  *joints;
-
-void check_scales(hal_float_t *scale,float *scale_old, double *scale_rcpt) {
-  // check for change in scale value
-  if (*scale != *scale_old) {
-    // scale value has changed, test and update it
-    if ((*scale < 1e-20) && (*scale > -1e-20)) {
-      // value too small, divide by zero is a bad thing
-      *scale = 1.0;
-    }
-    // save new scale to detect future changes
-    *scale_old = *scale;
-    // we actually want the reciprocal
-    *scale_rcpt = 1.0 / *scale;
-  }
-}
-
-//========================================================
-// motmod function ptrs for functions called BY homecomp:
-static void(*SetRotaryUnlock)(int,int);
-static int (*GetRotaryIsUnlocked)(int);
-
-//========================================================
-// functions ptrs received from motmod:
-void homeMotFunctions(void(*pSetRotaryUnlock)(int,int)
-                     ,int (*pGetRotaryIsUnlocked)(int)
-                     )
-{
-    SetRotaryUnlock     = *pSetRotaryUnlock;
-    GetRotaryIsUnlocked = *pGetRotaryIsUnlocked;
-}
-
-// emcmot pointers received from motmod
-void homeMotData(emcmot_config_t * pconfig
-                ,emcmot_joint_t  * pjoints
-                )
-{
-    emcmotConfig = pconfig;
-    joints       = pjoints;
-}
-//========================================================
-
-
-
-void cia_read(int jno, one_joint_home_data_t *addr)
-{
-
-  clock_t t_period;  // period between call in clocks
-  float f_period;    // period in seconds
-  clock_t period;    // we need to make our own period variable as it does not exist in this kind of component
-  
-  t_period = clock() - last_time;
-  period = t_period * (CLOCKS_PER_SEC / 1e+9);  // convert to nanoseconds
-  f_period = (float)t_period * ((float) t_period/(float)CLOCKS_PER_SEC);
-  last_time += t_period;
-
-  H[jno].Status.Word = *addr->cia_status; // copy to union structure to decode bitmap
-  // check for change in scale value
-  check_scales(&H[jno].pos_scale, &H[jno].pos_scale_old, &H[jno].pos_scale_rcpt);
-  check_scales(&H[jno].vel_scale, &H[jno].velo_scale_old, &H[jno].velo_scale_rcpt);
-
-	// read position feedback
-	H[jno].pos_fb = ((double)H[jno].drv_actual_position) * H[jno].pos_scale_rcpt;
-	if(H[jno].home_state == HOME_SEEKING){
-		H[jno].pos_fb = H[jno].pos_cmd;    // this is important as it "eats" the following errors when the drives moves without lcnc control
-	}
-	// read velocity feedback
-	H[jno].velocity_fb = ((double)H[jno].drv_actual_velocity) * H[jno].velo_scale_rcpt;
-
- // read Modes of Operation
-  H[jno].opmode_no_mode = (H[jno].opmode_display == OPMODE_NONE);
-  H[jno].opmode_homing = (H[jno].opmode_display == OPMODE_HOMING);
-  H[jno].opmode_cyclic_velocity = (H[jno].opmode_display == OPMODE_CYCLIC_VELOCITY);
-  H[jno].opmode_cyclic_position = (H[jno].opmode_display == OPMODE_CYCLIC_POSITION);
-
-  // read status
-
-  H[jno].stat_switchon_ready     = H[jno].Status.b.ReadyToSwitchOn;  // (statusword >> 0) & 1;
-  H[jno].stat_switched_on         = H[jno].Status.b.SwitchOn;         //(statusword >> 1) & 1;
-  H[jno].stat_op_enabled         = H[jno].Status.b.OperationEnabled; //(statusword >> 2) & 1;
-  H[jno].stat_fault              = H[jno].Status.b.Fault;            //(statusword >> 3) & 1;
-  H[jno].stat_voltage_enabled    = H[jno].Status.b.VoltageEnabled;   //(statusword >> 4) & 1;
-  H[jno].stat_quick_stop         = H[jno].Status.b.QuickStop;        //(statusword >> 5) & 1;
-  H[jno].stat_switchon_disabled  = H[jno].Status.b.SwitchOnDisabled; //(statusword >> 6) & 1;
-  H[jno].stat_warning            = H[jno].Status.b.Warning;          //(statusword >> 7) & 1;
-  H[jno].stat_remote             = H[jno].Status.b.Remote;           //(statusword >> 9) & 1;
-  if(H[jno].opmode_cyclic_position || H[jno].opmode_cyclic_velocity) {
-    H[jno].stat_target_reached   = H[jno].Status.b.TargetReached;   //(statusword >> 10) & 1;
-  } else {
-      H[jno].stat_target_reached = 0;
-  }
-  if (H[jno].opmode_homing) {
-    H[jno].stat_homed    = (H[jno].Status.b.TargetReached  && H[jno].Status.b.bit12); //stat_homed    = ((statusword >> 10) & 1) && ((statusword >> 12) & 1);
-    H[jno].stat_homing   = !H[jno].stat_homed && !H[jno].Status.b.TargetReached;
-  }
-  // update fault output
-  if (H[jno].auto_fault_reset_delay > 0) {
-     H[jno].auto_fault_reset_delay -= period;
-     H[jno].drv_fault = 0;
-  } else {
-     H[jno].drv_fault = H[jno].stat_fault && H[jno].enable;
-  }
-#ifdef DEBUG
-  if(last_f_period > HEARTBEAT)  //toggle the heartbeat
-     H[jno].heartbeat ^= 1;
-  if(jno == EMCMOT_MAX_JOINTS){  // last joint so increment the heartbeat and clear if necessary
-      if(last_f_period > HEARTBEAT)
-        last_f_period = 0;
-      else
-        last_f_period += f_period;
-
-  }
-#endif
-}
-
-
-void cia_write(int jno)
-{
-  int enable_edge;
-
-  //init opmode
-    if (!H[jno].init_pos ==  H[jno].pos_mode) {
-      H[jno].pos_mode = H[jno].csp_mode;
-      H[jno].init_pos_mode = 1;
-  }
-
-
-  // detect enable edge
-  enable_edge = H[jno].enable && !H[jno].enable_old;
-  H[jno].enable_old = H[jno].enable;
-
-
-  // write control register
-  H[jno].Control.b.QuickStop = 1; // quick stop is not supported  - might need to review this
-  if (H[jno].stat_fault) {
-    H[jno].home = 0;
-    if (H[jno].fault_reset) {
-      //controlword |= (1 << 7); fault reset
-      H[jno].Control.b.Faultreset = 1;
-    }
-    if (H[jno].auto_fault_reset && enable_edge) {
-      H[jno].auto_fault_reset_delay = FAULT_AUTORESET_DELAY_NS;
-      //controlword |= (1 << 7);  fault reset
-      H[jno].Control.b.Faultreset = 1;
-    }
-  } else {
-    if (H[jno].enable) {
-      H[jno].Control.b.EnableVoltage = 1;       //controlword |= (1 << 1);  enable voltage
-      if (H[jno].stat_switchon_ready) {
-        H[jno].Control.b.SwitchOn = 1;          //controlword |= (1 << 0);  switch on
-        if (H[jno].stat_switched_on) {
-          H[jno].Control.b.EnableOperation = 1; //controlword |= (1 << 3);  enable op
-        }
-      }
-    }
-  }
-
-  // write position command
-  H[jno].drv_target_position = (int32_t) (H[jno].pos_cmd * H[jno].pos_scale);
-  // write velocity command
-  H[jno].drv_target_velocity = (int32_t) (H[jno].vel_cmd * H[jno].vel_scale);
-
-  // OP Mode
-  // set to position mode
-  if (H[jno].stat_voltage_enabled && !H[jno].start_homing ) {
-    H[jno].opmode = OPMODE_CYCLIC_POSITION;
-  }
-  // set velo mode
-  if (!H[jno].stat_voltage_enabled && !!H[jno].pos_mode && !H[jno].start_homing) {
-    H[jno].opmode = OPMODE_CYCLIC_VELOCITY;
-  }
-
-
- if (H[jno].start_homing) {
-  	switch (H[jno].home_state){
-  		case HOME_TRIGGER:
-        // Homing has been requested
-  			H[jno].opmode  = OPMODE_HOMING;
-  			H[jno].home_state = HOME_CONFIRM;
-  			break;
-  		case HOME_CONFIRM:
-  			if (H[jno].opmode_homing) {
-          // Homing request has been accepted by drive
-          H[jno].Control.b.StartHome  = 1;
-  				H[jno].home_state = HOME_SEEKING;
-  			}
-  			break;
-  		case HOME_SEEKING:
-  		  if(H[jno].stat_homed){
-           // Drive has been homed, reset start_homing and state machine
-  			   H[jno].start_homing = 0;
-  			   H[jno].home_state =  HOME_TRIGGER;
-  			}
-  		    break;
-  	}
-    H[jno].stat_homed_old = H[jno].stat_homed;
-    H[jno].cia_control =  H[jno].Control.Word;
-  }
-
-  H[jno].cia_control              =  H[jno].Control.Word;
-/*
-
-  H[jno].cia_target_pos           =
-  H[jno].cia_target_vel           =
-  H[jno].cia_stat_homed           =
-  H[jno].cia_opmode               =
-  H[jno].cia_pos_scale            =
-  H[jno].cia_vel_scale            =
-  H[jno].cia_stat_homed           =
-  H[jno].cia_start_homing         =
-  H[jno].stat_switchon_ready      =
-  H[jno].stat_switched_on         =
-  H[jno].stat_op_enabled          =
-  H[jno].stat_voltage_enabled     =
-  H[jno].cia_stat_homing          =
-  H[jno].stat_fault               =
-  H[jno].stat_quick_stop          =
-  H[jno].stat_switchon_disabled   =
-  H[jno].stat_warning             =
-  H[jno].stat_remote              =
-  H[jno].stat_target_reached      =
-  H[jno].opmode_no_mode           =
-  H[jno].opmode_homing            =
-  H[jno].opmode_cyclic_position   =
-  H[jno].opmode-cyclic-velocity   =
-*/
-}
-
 
 static int makepins(int id,int njoints)
 {
@@ -628,222 +303,1350 @@ static int makepins(int id,int njoints)
                                   "joint.%d.home-state", jno);
         retval += hal_pin_bit_newf(HAL_IO, &(addr->index_enable), id,
                                   "joint.%d.index-enable", jno);
-        // cia402 pins
-        retval += hal_pin_bit_newf(HAL_OUT, &(addr->cia_control), id,
-                                  "joint.%d.cia-control", jno);
-        retval += hal_pin_bit_newf(HAL_IN, &(addr->cia_status), id,
-                                  "joint.%d.cia-status", jno);
-        retval += hal_pin_bit_newf(HAL_OUT, &(addr->cia_target_pos), id,
-                                  "joint.%d.cia-target-pos", jno);
-        retval += hal_pin_bit_newf(HAL_OUT, &(addr->cia_target_vel), id,
-                                  "joint.%d.cia-target-vel", jno);
-        retval += hal_pin_bit_newf(HAL_OUT, &(addr->cia_opmode), id,
+        retval += hal_pin_s32_newf(HAL_OUT, &(addr->tperiod), id,
+                                  "joint.%d.cia-period", jno);  
+        retval += hal_pin_u32_newf(HAL_IN, &(addr->statusword), id,
+                                  "joint.%d.cia-statusword", jno);
+        retval += hal_pin_s32_newf(HAL_IN, (volatile int **)&(addr->opmode_display), id,
+                                  "joint.%d.cia-opmode-display", jno);
+        retval += hal_pin_s32_newf(HAL_IN, (volatile int **)&(addr->drv_actual_position), id,
+                                  "joint.%d.cia-drv-actual_position", jno);
+       retval += hal_pin_s32_newf(HAL_IN, (volatile int **)&(addr->drv_actual_velocity), id,
+                                  "joint.%d.cia-drv-actual-velocity", jno);                                 
+        retval += hal_pin_u32_newf(HAL_OUT, (volatile unsigned int **)&(addr->controlword), id,
+                                  "joint.%d.cia-controlword", jno);
+        retval += hal_pin_s32_newf(HAL_OUT, (volatile int **)&(addr->opmode), id,
                                   "joint.%d.cia-opmode", jno);
-        retval += hal_pin_float_newf(HAL_IO, &(addr->pos_cmd), id,
-                                  "joint.%d.cia-pos-cmd", jno);
-
-        retval += hal_pin_float_newf(HAL_IO, &(addr->vel_cmd), id,
-                                  "joint.%d.cia-vel-cmd", jno);
-
-        retval += hal_pin_float_newf(HAL_IO, &(addr->cia_pos_scale), id,
-                                  "joint.%d.cia-pos-scale", jno);
-        retval += hal_pin_float_newf(HAL_IO, &(addr->cia_vel_scale), id,
-                                  "joint.%d.cia-vel-scale", jno);
-
-        retval += hal_pin_s32_newf(HAL_IN, &(addr->cia_drv_actual_position), id,
-                                  "joint.%d.cia-drv-actual-position", jno);
-        retval += hal_pin_s32_newf(HAL_IN, &(addr->cia_drv_actual_velocity), id,
-                                  "joint.%d.cia-drv-actual-velocity", jno);
-        retval += hal_pin_bit_newf(HAL_IN, &(addr->cia_enable), id,
-                                  "joint.%d.cia-enable", jno);;
-        retval += hal_pin_s32_newf(HAL_IO, &(addr->cia_start_homing), id,
-                                  "joint.%d.cia-start-homing", jno);
-        retval += hal_pin_bit_newf(HAL_OUT, &(addr->cia_stat_homed), id,
+        retval += hal_pin_s32_newf(HAL_OUT, (volatile  int **)&(addr->drv_target_position), id,
+                                  "joint.%d.cia-drv-target-position", jno);
+        retval += hal_pin_s32_newf(HAL_OUT, (volatile  int **)&(addr->drv_target_velocity), id,
+                                  "joint.%d.cia-drv-target-velocity", jno);   
+		retval += hal_pin_bit_newf(HAL_IN, &(addr->cia_enable), id,
+                                  "joint.%d.cia-enable", jno);   
+		retval += hal_pin_float_newf(HAL_IN, (volatile double **)&(addr->cia_pos_cmd), id,
+                                  "joint.%d.cia-pos-cmd", jno);                                                                                                                       
+		retval += hal_pin_float_newf(HAL_IN, (volatile double **)&(addr->cia_velocity_cmd), id,
+                                  "joint.%d.cia.velocity-cmd", jno);                                                                                                                       
+		retval += hal_pin_float_newf(HAL_OUT, (volatile double **)&(addr->cia_pos_fb), id,
+                                  "joint.%d.cia-pos-fb", jno);                                                                                                                       
+		retval += hal_pin_float_newf(HAL_OUT, (volatile double **)&(addr->cia_velocity_fb), id,
+                                  "joint.%d.cia-velocity-fb", jno);                                                                                                                       
+        retval += hal_pin_bit_newf(HAL_OUT, &(addr->cia_drv_fault), id,
+                                  "joint.%d.cia-drv-fault", jno);
+        retval += hal_pin_bit_newf(HAL_IO, &(addr->cia_home), id,
+                                  "joint.%d.cia-home", jno);
+        retval += hal_pin_bit_newf(HAL_OUT, &(addr->stat_homed), id,
                                   "joint.%d.cia-stat-homed", jno);
-        // Auxilliary IO's
-        retval += hal_pin_bit_newf(HAL_OUT, &(addr->stat_switchon_ready), id,
-                                  "joint.%d.cia-stat-switchon_ready", jno);
-        retval += hal_pin_bit_newf(HAL_OUT, &(addr->stat_switched_on), id,
-                                  "joint.%d.cia-stat-switched-on", jno);
-        retval += hal_pin_bit_newf(HAL_OUT, &(addr->stat_op_enabled), id,
-                                  "joint.%d.cia-stat-op-enabled", jno);
-        retval += hal_pin_bit_newf(HAL_OUT, &(addr->stat_voltage_enabled), id,
-                                  "joint.%d.cia-stat-voltage-enabled", jno);
-        retval += hal_pin_bit_newf(HAL_OUT, &(addr->cia_stat_homing), id,
+        retval += hal_pin_bit_newf(HAL_OUT, &(addr->stat_homing), id,
                                   "joint.%d.cia-stat-homing", jno);
-        retval += hal_pin_bit_newf(HAL_OUT, &(addr->stat_fault), id,
-                                  "joint.%d.cia-stat-fault", jno);
-        retval += hal_pin_bit_newf(HAL_OUT, &(addr->stat_quick_stop), id,
-                                  "joint.%d.cia-stat-quick-stop", jno);
-        retval += hal_pin_bit_newf(HAL_OUT, &(addr->stat_switchon_disabled), id,
-                                  "joint.%d.cia-stat-switchon-disabled", jno);
-        retval += hal_pin_bit_newf(HAL_OUT, &(addr->stat_warning), id,
-                                  "joint.%d.cia-stat-warning", jno);
-        retval += hal_pin_bit_newf(HAL_OUT, &(addr->stat_remote), id,
-                                  "joint.%d.cia-stat-remote", jno);
-        retval += hal_pin_bit_newf(HAL_OUT, &(addr->stat_target_reached), id,
-                                  "joint.%d.cia-stat-target-reached", jno);
-        retval += hal_pin_bit_newf(HAL_OUT, &(addr->opmode_no_mode), id,
-                                  "joint.%d.cia-opmode-no-mode", jno);
-        retval += hal_pin_bit_newf(HAL_OUT, &(addr->opmode_homing), id,
-                                  "joint.%d.cia-opmode-homing", jno);
-        retval += hal_pin_bit_newf(HAL_OUT, &(addr->opmode_cyclic_position), id,
-                                  "joint.%d.cia-opmode-cyclic-position", jno);
-        retval += hal_pin_bit_newf(HAL_OUT, &(addr->opmode_cyclic_velocity), id,
-                                  "joint.%d.cia-opmode-cyclic-velocity", jno);
-        retval += hal_pin_bit_newf(HAL_OUT, &(addr->pos_mode), id,
-                                  "joint.%d.cia-pos-mode", jno);
-        retval += hal_pin_bit_newf(HAL_OUT, &(addr->fault_reset), id,
-                                  "joint.%d.cia-fault_reset", jno);
-        retval += hal_pin_bit_newf(HAL_OUT, &(addr->drv_fault), id,
-                                  "joint.%d.cia-drv_fault", jno);
-#ifdef DEBUG
-        retval += hal_pin_bit_newf(HAL_OUT, &(addr->heartbeat), id,
-                                  "joint.%d.cia-heartbeat", jno);
-#endif
 
     }
-    rtapi_print_msg(RTAPI_MSG_ERR, "HOMING: make pins completed\n");
     return retval;
 }
+
+static void do_home_one_joint(int jno)
+{
+    //NOTE: if home_sequence neg, home all joints in sequence
+    int jj;
+    if (H[jno].home_sequence < 0) {  //neg: home all joints in sequence
+        sequence_state = HOME_SEQUENCE_DO_ONE_SEQUENCE;
+        for (jj = 0; jj < all_joints; jj++) {
+            if (ABS(H[jj].home_sequence) == ABS(H[jno].home_sequence)) {
+                // set home_state for all joints with same sequence
+                H[jj].home_state = HOME_START;
+            }
+        }
+    } else {
+        sequence_state = HOME_SEQUENCE_DO_ONE_JOINT;
+    }
+    H[jno].home_state = HOME_START;
+} // do_home_one_joint()
+
+static void set_all_unhomed(int unhome_method, motion_state_t motstate) 
+{
+    /* 
+    ** unhome_method == -1: unhome all joints
+    ** unhome_method == -2: unhome joints marked as VOLATILE_HOME
+    */
+    int jno;
+    emcmot_joint_t *joint;
+    /* we want all or none, so these checks need to all be done first.
+     * but, let's only report the first error.  There might be several,
+     * for instance if a homing sequence is running. */
+    for (jno = 0; jno < all_joints; jno++) {
+        joint = &joints[jno];
+        if(GET_JOINT_ACTIVE_FLAG(joint)) {
+            if (get_homing(jno)) {
+                rtapi_print_msg(RTAPI_MSG_ERR,("Cannot unhome while homing, joint %d"), jno);
+                return;
+            }
+            if (!GET_JOINT_INPOS_FLAG(joint)) {
+                rtapi_print_msg(RTAPI_MSG_ERR,("Cannot unhome while moving, joint %d"), jno);
+                return;
+            }
+        }
+        if (   (jno >= (all_joints - extra_joints))  // jno is extrajoint
+            && (motstate != EMCMOT_MOTION_DISABLED)) {
+            rtapi_print_msg(RTAPI_MSG_ERR,("Cannot unhome extrajoint <%d> with motion enabled"), jno);
+            return;
+        }
+    }
+    /* we made it through the checks, so unhome them all per unhome_method */
+    for (jno = 0; jno < all_joints; jno++) {
+        joint = &joints[jno];
+        if(GET_JOINT_ACTIVE_FLAG(joint)) {
+            if (     (unhome_method == -1)
+                || ( (unhome_method == -2) && (H[jno].volatile_home) )
+               ) {
+                H[jno].homed = 0;
+            }
+        }
+    }
+} // set_all_unhomed()
 
 //========================================================
 // All functions required for homing api
 // For homecomp.comp: most are skeleton
 
-bool do_homing(void)                                 {return 1;}
-void do_homing_sequence(void)                        {return;}
-bool get_allhomed()                                  {return 1;}
-bool get_homed(int jno)                              {return 1;}
-bool get_home_is_idle(int jno)                       {return 1;}
-bool get_home_is_synchronized(int jno)               {return 0;}
-bool get_home_is_volatile(int jno)                   {return 0;}
-bool get_home_needs_unlock_first(int jno)            {return 0;}
-int  get_home_sequence(int jno)                      {return 0;}
-home_sequence_state_t get_home_sequence_state() {return HOME_SEQUENCE_IDLE;}
-bool get_homing(int jno)                             {return 0;}
-bool get_homing_at_index_search_wait(int jno)        {return 0;}
-bool get_homing_is_active()                          {return 0;}
-int  homing_init(int id,int njoints)          {return makepins(id,njoints);}
-bool get_index_enable(int jno)                       {return 0;}
-
-  void write_homing_out_pins(int njoints)
+static void do_home_all(void)
 {
-    int jno;
-    one_joint_home_data_t *addr;
-    for (jno = 0; jno < njoints; jno++) {
-        cia_write(jno);
-        addr = &(joint_home_data->jhd[jno]);
-        *(addr->homing)                  = H[jno].homing;       // OUT
-        *(addr->homed)                   = H[jno].homed;        // OUT
-        *(addr->home_state)              = H[jno].home_state;   // OUT
-        *(addr->index_enable)            = H[jno].index_enable; // IO
-        *(addr->cia_control)             = H[jno].cia_control;  // OUT;
-        *(addr->cia_target_pos)          = H[jno].target_pos;
-        *(addr->cia_target_vel)          = H[jno].target_vel;
-        *(addr->cia_stat_homed)          = H[jno].stat_homed;
-        *(addr->cia_stat_homed_old)      = H[jno].stat_homed_old;
-        *(addr->cia_opmode)              = H[jno].opmode;
-        *(addr->cia_pos_scale)           = H[jno].pos_scale;
-        *(addr->cia_vel_scale)           = H[jno].vel_scale;
-        *(addr->cia_start_homing)        = H[jno].start_homing;
-        *(addr->stat_switchon_ready)     = H[jno].stat_switchon_ready;
-        *(addr->stat_switched_on)        = H[jno].stat_switched_on;
-        *(addr->stat_op_enabled)         = H[jno].stat_op_enabled;
-        *(addr->stat_voltage_enabled)    = H[jno].stat_voltage_enabled;
-        *(addr->cia_stat_homing)         = H[jno].stat_homing;
-        *(addr->stat_fault)              = H[jno].stat_fault;
-        *(addr->stat_quick_stop)         = H[jno].stat_quick_stop;
-        *(addr->stat_switchon_disabled)  = H[jno].stat_switchon_disabled;
-        *(addr->stat_warning)            = H[jno].stat_warning;
-        *(addr->stat_remote)             = H[jno].stat_remote;
-        *(addr->stat_target_reached)     = H[jno].stat_target_reached;
-        *(addr->opmode_no_mode)          = H[jno].opmode_no_mode;
-        *(addr->opmode_homing)           = H[jno].opmode_homing;
-        *(addr->opmode_cyclic_position)  = H[jno].opmode_cyclic_position;
-        *(addr->opmode_cyclic_velocity)  = H[jno].opmode_cyclic_velocity;
-        *(addr->pos_mode)                = H[jno].pos_mode;
-        *(addr->fault_reset)             = H[jno].fault_reset;
-        *(addr->drv_fault)               = H[jno].drv_fault;
-#ifdef DEBUG
-        *(addr->heartbeat)               = H[jno].heartbeat;
-
-#endif
-        // TODO -- Need to write out the rest of the CIA pins
+    if (!get_homing_is_active() ) {
+        sequence_state = HOME_SEQUENCE_START;
     }
-    return;
+} // do_home_all()
+
+
+static void update_home_is_synchronized(void) {
+    // invoke anytime H[*].home_sequence is altered
+    int jno,jj,joint_num;
+
+    // first, clear all H[*].home_is_synchronized
+    for (jno = 0; jno < all_joints; jno++) {
+        H[jno].home_is_synchronized = 0;
+        if (H[jno].home_sequence < 0) {
+            // neg: sync all joints with same ABS(home_sequence):
+            for (jj = 0; jj < all_joints; jj++) {
+                if (ABS(H[jj].home_sequence) == ABS(H[jno].home_sequence)) {
+                    H[jj].home_sequence = H[jno].home_sequence;
+                }
+            }
+        }
+    }
+    for (jno = 0; jno < all_joints; jno++) {
+        if (H[jno].home_sequence < 0) {
+            H[jno].home_is_synchronized = 1;
+            continue;
+        }
+        for (joint_num = 0; joint_num < all_joints; joint_num++) {
+            if (joint_num == jno) continue;
+            if (   (    H[joint_num].home_sequence < 0)
+                && (ABS(H[joint_num].home_sequence) == H[jno].home_sequence) )  {
+                H[jno].home_is_synchronized = 1;
+                H[joint_num].home_is_synchronized = 1;
+            }
+        }
+    }
 }
 
-void read_homing_in_pins(int njoints)
-{
-    int jno;
-    one_joint_home_data_t *addr;
-    for (jno = 0; jno < njoints; jno++) {
-        addr = &(joint_home_data->jhd[jno]);
-        H[jno].index_enable = *(addr->index_enable); // IO
-        // cia read code follows
-        H[jno].cia_status = *(addr->cia_status);      // IN
+int  homing_init(int id,
+                 double servo_period,
+                 int n_joints,
+                 int n_extrajoints,
+                 emcmot_joint_t* pjoints) {
+     joints = pjoints;
+     int i;
+     all_joints   = n_joints;
+     extra_joints = n_extrajoints;
+     if(makepins(id,n_joints)){
+		rtapi_print_msg(RTAPI_MSG_ERR,"%s: make_joint_home_pins fail\n", __FUNCTION__);     
+        return -1;
+     }
+     servo_freq = 1/servo_period;
+     homing_active = 0;
+     for (i=0; i < n_joints; i++) {
+        // set default pin values, Not all pins used       
+        H[i].tperiod      =  100;
+        H[i].home_state      =  HOME_IDLE;
+        H[i].home_search_vel =  0;
+        H[i].home_latch_vel  =  0;
+        H[i].home_final_vel  =  0;
+        H[i].home_offset     =  0;
+        H[i].home            =  0;
+        H[i].home_flags      =  0;
+        H[i].home_sequence   = 1000; //startup: unrealizable, positive seq no.
+        H[i].volatile_home   =  0;
 
-        // TODO -- Need to read in the rest of the CIA pins
-
-        cia_read(jno, addr);
     }
+    return 0;
+}
 
+
+bool get_allhomed()                                  
+{
+    int joint_num;
+    emcmot_joint_t *joint;
+
+    for (joint_num = 0; joint_num < all_joints; joint_num++) {
+        joint = &joints[joint_num];
+        if (!GET_JOINT_ACTIVE_FLAG(joint)) {
+            /* if joint is not active, don't even look at its limits */
+            continue;
+        }
+        if (!get_homed(joint_num) ) {
+            /* if any of the joints is not homed return false */
+            return 0;
+        }
+    }
+    /* return true if all active joints are homed*/
+    return 1;
+}
+
+bool get_homed(int jno)                              
+{
+    return H[jno].homed;
+}
+
+bool get_home_is_idle(int jno)                       
+{
+	return H[jno].home_state == HOME_IDLE ? 1 : 0;
+}
+
+bool get_home_is_synchronized(int jno)
+{
+	return H[jno].home_is_synchronized;
+}
+
+bool get_home_needs_unlock_first(int jno)            
+{
+    return (H[jno].home_flags & HOME_UNLOCK_FIRST) ? 1 : 0;
+}
+
+int  get_home_sequence(int jno)                      
+{
+    return H[jno].home_sequence;
+}
+
+bool get_homing(int jno)                             
+{
+    return H[jno].homing;
+}
+
+bool get_homing_at_index_search_wait(int jno)        
+{
+	return H[jno].home_state == HOME_INDEX_SEARCH_WAIT ? 1 : 0;
+}
+
+bool get_homing_is_active()                          
+{
+    return homing_active;
+}
+
+bool get_index_enable(int jno)                       
+{
+     return H[jno].index_enable;
+}
+
+void read_homing_in_pins(int njoints)                
+{
+  int jno; 
+  one_joint_home_data_t *addr;
+  for (jno = 0; jno < njoints; jno++) {
+    addr = &(joint_home_data->jhd[jno]);
+	H[jno].home_sw      = *(addr->home_sw);      // IN
+    H[jno].index_enable = *(addr->index_enable); // IO
+    H[jno].statusword = *(addr->statusword);                   // IN - Drives CiA402 Statusword, index 0x6041   
+    H[jno].Status.Word = H[jno].statusword;                    //    - bitmapped status overlay, not a pin
+    H[jno].opmode_display = *(addr->opmode_display);           // IN - Drives Modes of Operation feedback register, index 0x6061
+    H[jno].drv_actual_position = *(addr->drv_actual_position); // IN - Drives actual Position, index 0x6064
+    H[jno].drv_actual_velocity = *(addr->drv_actual_velocity); // IN - Drives actual Velocity, index 0x606C
+	H[jno].enable = *(addr->cia_enable);                       // IN - true enables the Drive
+	H[jno].pos_cmd = *(addr->cia_pos_cmd);                     // IN - target Position, from Motion or PID	
+	H[jno].velocity_cmd = *(addr->cia_velocity_cmd);           // IN - target Velocity, from Motion or PID
+    H[jno].cia_home      = *(addr->cia_home);                  // IO - true starts the Drives internal home procedure
+  }
   return;
 }
 
-void set_home_abort(int jno)                         {return;}
-void set_home_idle(int jno)                          {return;}
-void set_home_sequence_state(home_sequence_state_t s_state) {return;}
-void set_home_start(int jno)                         {return;}
-void set_joint_at_home(int jno, bool value)          {return;}
-void set_joint_homed(int jno,bool value)             {return;}
-void set_joint_homing(int jno,bool value)            {return;}
+void do_home_joint(int jno)                          
+{
+    if (jno == -1) {
+        do_home_all();
+    } else {
+        do_home_one_joint(jno); // apply rules if home_sequence negative
+    }
+}
+
+void set_unhomed(int jno,motion_state_t motstate)    
+{
+    // Note: negative jno ==> unhome multiple joints
+    emcmot_joint_t *joint;
+    if (jno < 0) { set_all_unhomed(jno,motstate); return; }
+
+    if (jno > all_joints) {
+        /* invalid joint number specified */
+        rtapi_print_msg(RTAPI_MSG_ERR,("Cannot unhome invalid joint %d (max %d)\n"), jno, (all_joints-1));
+        return;
+    }
+    /* request was for one joint number */
+    if (   (jno >= (all_joints - extra_joints) )  // jno is extrajoint
+        && (motstate != EMCMOT_MOTION_DISABLED)) {
+        rtapi_print_msg(RTAPI_MSG_ERR,("Cannot unhome extrajoint <%d> with motion enabled\n"), jno);
+        return;
+    }
+    joint = &joints[jno];
+    if(GET_JOINT_ACTIVE_FLAG(joint) ) {
+        if (get_homing(jno) ) {
+            rtapi_print_msg(RTAPI_MSG_ERR,("Cannot unhome while homing, joint %d\n"), jno);
+            return;
+        }
+        if (!GET_JOINT_INPOS_FLAG(joint) ) {
+            rtapi_print_msg(RTAPI_MSG_ERR,("Cannot unhome while moving, joint %d\n"), jno);
+            return;
+        }
+        H[jno].homed = 0;
+    } else {
+        rtapi_print_msg(RTAPI_MSG_ERR,("Cannot unhome inactive joint %d\n"), jno);
+    }
+
+}
+
+void do_cancel_homing(int jno)                       
+{
+    if (H[jno].homing) {
+        H[jno].home_state = HOME_ABORT;
+    }
+}
+
 void set_joint_homing_params(int    jno,
                              double offset,
                              double home,
                              double home_final_vel,
-                             double home_latch_vel,
                              double home_search_vel,
+                             double home_latch_vel,
                              int    home_flags,
                              int    home_sequence,
                              bool   volatile_home
-                             )                       {return;}
+                             )                       
+{
+// Not all of the pins passed here are required
+    H[jno].home_offset     = offset;
+    H[jno].home            = home;
+    H[jno].home_flags      = home_flags;
+    H[jno].home_sequence   = home_sequence;
+    H[jno].home_final_vel  = home_final_vel;
+    H[jno].home_search_vel = home_search_vel;
+    H[jno].home_latch_vel  = home_latch_vel;
+    H[jno].volatile_home   = volatile_home;
+    update_home_is_synchronized();
+}
+
 void update_joint_homing_params (int    jno,
                                  double offset,
                                  double home,
                                  int    home_sequence
-                                )                    {return;}
+                                )                    
+{
+	H[jno].home_offset   = offset;
+    H[jno].home          = home;
+    H[jno].home_sequence = home_sequence;
+    update_home_is_synchronized();
+}
+
+void write_homing_out_pins(int njoints)              
+{
+    int jno;
+    one_joint_home_data_t *addr;
+    for (jno = 0; jno < njoints; jno++) {
+        H[jno].tperiod += 1;
+        addr = &(joint_home_data->jhd[jno]);
+        *(addr->homing)       = H[jno].homing;         // OUT
+        *(addr->homed)        = H[jno].homed;          // OUT
+        *(addr->home_state)   = H[jno].home_state;     // OUT
+        *(addr->index_enable) = H[jno].index_enable;   // IO
+	    *(addr->controlword) = H[jno].controlword;     // OUT
+	    H[jno].Control.Word = H[jno].controlword;      // Save status to bitmapped struct
+        *(addr->opmode) = H[jno].opmode;               // OUT
+        *(addr->cia_pos_fb) = H[jno].pos_fb;           // OUT                
+        *(addr->cia_velocity_fb) = H[jno].velocity_fb; // OUT                
+        *(addr->drv_target_position) = H[jno].drv_target_position; // OUT                
+        *(addr->cia_pos_fb) = H[jno].pos_fb;           // OUT                
+        *(addr->cia_velocity_fb) = H[jno].velocity_fb; // OUT               
+        *(addr->cia_drv_fault) = H[jno].drv_fault;     // OUT  
+        *(addr->cia_home) = H[jno].cia_home; // OUT 
+        *(addr->stat_homed) = H[jno].stat_homed;       // OUT 
+        *(addr->stat_homing) = H[jno].stat_homing;     // OUT
+        *(addr->tperiod)      = H[jno].tperiod;        // OUT - delete me for testing only
+    }
+    return;
+}
 
 
+static void do_homing_sequence(void)
+{
+    int i,ii;
+    int special_case_sync_all;
+    int seen = 0;
+    emcmot_joint_t *joint;
+    int sequence_is_set = 0;
+    /* first pass init */
+    if(home_sequence == -1) {
+        sequence_state = HOME_SEQUENCE_IDLE;
+        home_sequence = 0;
+    }
+
+    switch( sequence_state ) {
+    case HOME_SEQUENCE_IDLE:
+        /* nothing to do */
+        break;
+
+    case HOME_SEQUENCE_DO_ONE_JOINT:
+        // Expect one joint with home_state==HOME_START
+        for (i=0; i < all_joints; i++) {
+            if (H[i].home_state == HOME_START) {
+               H[i].joint_in_sequence = 1;
+               home_sequence = ABS(H[i].home_sequence);
+            } else {
+               if (H[i].joint_in_sequence) {
+                   // it may already be running, leave alone
+               } else {
+                   H[i].joint_in_sequence = 0;
+               }
+            }
+        }
+        sequence_is_set = 1;
+        //drop through----drop through----drop through----drop through
+
+    case HOME_SEQUENCE_DO_ONE_SEQUENCE:
+        // Expect multiple joints with home_state==HOME_START
+        // specified by a negative sequence
+        // Determine home_sequence and set H[i].joint_in_sequence
+        // based on home_state[i] == HOME_START
+        if (!sequence_is_set) {
+            for (i=0; i < all_joints; i++) {
+                if (H[i].home_state == HOME_START) {
+                    if (   sequence_is_set
+                        && (ABS(H[i].home_sequence) != home_sequence)) {
+                        rtapi_print_msg(RTAPI_MSG_ERR,
+                           ("homing.c Unexpected joint=%d jsequence=%d seq=%d\n")
+                           ,i,H[i].home_sequence,home_sequence);
+                    }
+                    home_sequence = ABS(H[i].home_sequence);
+                    sequence_is_set = 1;
+                }
+                H[i].joint_in_sequence = 1; //disprove
+                if  (   (H[i].home_state != HOME_START)
+                     || (home_sequence     != ABS(H[i].home_sequence))
+                    ) {
+                    H[i].joint_in_sequence = 0;
+                }
+            }
+        }
+        sequence_state = HOME_SEQUENCE_START;
+
+        //drop through----drop through----drop through----drop through
+
+    case HOME_SEQUENCE_START:
+        // Request to home all joints or a single sequence
+        // A negative H[i].home_sequence means sync final move
+        if (!sequence_is_set) {
+            // sequence_is_set not otherwise established: home-all
+            for (i=0; i < EMCMOT_MAX_JOINTS; i++) {
+                H[i].joint_in_sequence = 1;
+                // unspecified joints have an unrealizable home_sequence:
+                if (H[i].home_sequence >100) {
+                   // docs: 'If HOME_SEQUENCE is not specified then this joint
+                   //        will not be homed by the HOME ALL sequence'
+                   H[i].joint_in_sequence = 0;  // per docs
+                }
+            }
+            sequence_is_set = 1;
+            home_sequence = 0;
+        }
+        /* Initializations */
+        for(i=0; i < MAX_HOME_SEQUENCES; i++) {
+            H[i].sync_final_move = 0; //reset to allow a rehome
+        }
+        for(i=0; i < all_joints; i++) {
+            if (!H[i].joint_in_sequence) continue;
+            if (   (H[i].home_flags & HOME_NO_REHOME)
+                &&  H[i].homed
+               ) {
+                continue;
+            } else {
+                H[i].homed = 0;
+            }
+            if (H[i].home_sequence < 0) {
+                // if a H[i].home_sequence is neg, find all joints that
+                // have the same ABS sequence value and make them the same
+                for(ii=0; ii < all_joints; ii++) {
+                    if (H[ii].home_sequence == ABS(H[i].home_sequence)) {
+                        H[ii].home_sequence =      H[i].home_sequence;
+                    }
+                }
+            }
+        }
+        /*  special_case_sync_all: if home_sequence == -1 for all joints
+        *                          synchronize all joints final move
+        */
+        special_case_sync_all = 1; // disprove
+        for(i=0; i < all_joints; i++) {
+            if (H[i].home_sequence != -1) {special_case_sync_all = 0;}
+        }
+        if (special_case_sync_all) {
+            home_sequence = 1;
+        }
+        for(i=0; i < all_joints; i++) {
+            if (!H[i].joint_in_sequence) continue;
+            if  ( H[i].home_state != HOME_IDLE && H[i].home_state != HOME_START) {
+                /* a home is already in progress, abort the home-all */
+                sequence_state = HOME_SEQUENCE_IDLE;
+                return;
+            }
+        }
+        /* tell the world we're on the job */
+        homing_active = 1;
+        //drop through----drop through----drop through----drop through
+
+    case HOME_SEQUENCE_START_JOINTS:
+        /* start all joints whose sequence number matches home_sequence */
+        for(i=0; i < all_joints; i++) {
+            joint = &joints[i];
+            if(ABS(H[i].home_sequence) == home_sequence) {
+                if (!H[i].joint_in_sequence) continue;
+                /* start this joint */
+                joint->free_tp.enable = 0;
+                H[i].home_state = HOME_START;
+                seen++;
+            }
+        }
+        if (seen || home_sequence == 0) {
+            sequence_state = HOME_SEQUENCE_WAIT_JOINTS;
+        } else {
+            /* no joints have this sequence number, we're done */
+            sequence_state = HOME_SEQUENCE_IDLE;
+            /* tell the world */
+            homing_active = 0;
+        }
+        break;
+
+    case HOME_SEQUENCE_WAIT_JOINTS:
+        for(i=0; i < all_joints; i++) {
+            if (!H[i].joint_in_sequence) continue;
+            // negative H[i].home_sequence means sync final move
+            if(ABS(H[i].home_sequence) != home_sequence) {
+                /* this joint is not at the current sequence number, ignore it */
+                continue;
+            }
+            if(H[i].home_state != HOME_IDLE) {
+                /* still busy homing, keep waiting */
+                seen = 1;
+                continue;
+            }
+        }
+        if(!seen) {
+            /* all joints at this step have finished, move on to next step */
+            home_sequence ++;
+            sequence_state = HOME_SEQUENCE_START_JOINTS;
+        }
+        break;
+
+    default:
+        /* should never get here */
+        rtapi_print_msg(RTAPI_MSG_ERR, ("unknown state '%d' during homing sequence"),
+                        sequence_state);
+        sequence_state = HOME_SEQUENCE_IDLE;
+        homing_active = 0;
+        break;
+    }
+} // do_homing_sequence()
+
+/* 
+  PROBABLY NOT REQUIRED FOR CIA HOMING
+  'home_start_move()' starts a move at the specified velocity.  The
+   length of the move is equal to twice the overall range of the joint,
+   but the intent is that something (like a home switch or index pulse)
+   will stop it before that point. */
+static void home_start_move(emcmot_joint_t * joint, double vel)
+{
+    double joint_range;
+
+    /* set up a long move */
+    joint_range = joint->max_pos_limit - joint->min_pos_limit;
+    if (vel > 0.0) {
+        joint->free_tp.pos_cmd = joint->pos_cmd + 2.0 * joint_range;
+    } else {
+        joint->free_tp.pos_cmd = joint->pos_cmd - 2.0 * joint_range;
+    }
+    if (fabs(vel) < joint->vel_limit) {
+        joint->free_tp.max_vel = fabs(vel);
+    } else {
+        /* clamp on max vel for this joint */
+        joint->free_tp.max_vel = joint->vel_limit;
+    }
+    /* start the move */
+    joint->free_tp.enable = 1;
+} // home_start_move()
+
+/*
+   PROBABLY NOT REQUIRED FOR CIA HOMING
+  'home_do_moving_checks()' is called from states where the machine
+   is supposed to be moving.  It checks to see if the machine has
+   hit a limit, or if the move has stopped.  (Normally such moves
+   will be terminated by the home switch or an index pulse or some
+   other event, if the move goes to completion, something is wrong.) */
+static void home_do_moving_checks(emcmot_joint_t * joint,int jno)
+{
+    /* check for limit switches */
+    if (joint->on_pos_limit || joint->on_neg_limit) {
+        /* on limit, check to see if we should trip */
+        if (!(H[jno].home_flags & HOME_IGNORE_LIMITS)) {
+            /* not ignoring limits, time to quit */
+            rtapi_print_msg(RTAPI_MSG_ERR, ("hit limit in home state %d"), H[jno].home_state);
+            H[jno].home_state = HOME_ABORT;
+            immediate_state = 1;
+            return;
+        }
+    }
+    /* check for reached end of move */
+    if (!joint->free_tp.active) {
+        /* reached end of move without hitting switch */
+        joint->free_tp.enable = 0;
+        rtapi_print_msg(RTAPI_MSG_ERR,("end of move in home state %d"), H[jno].home_state);
+        H[jno].home_state = HOME_ABORT;
+        immediate_state = 1;
+        return;
+    }
+} // home_do_moving_checks()
+
+
+
+
+bool do_homing(void){
+    int allhomed = 0;
+    int joint_num;
+    emcmot_joint_t *joint;
+    double offset, tmp;
+    int home_sw_active, homing_flag;
+
+    do_homing_sequence();
+
+    homing_flag = 0;
+    /* loop thru joints, treat each one individually */
+    for (joint_num = 0; joint_num < all_joints; joint_num++) {
+        if (!H[joint_num].joint_in_sequence) continue;
+        /* point to joint struct */
+        joint = &joints[joint_num];
+        if (!GET_JOINT_ACTIVE_FLAG(joint)) {
+            /* if joint is not active, skip it */
+            continue;
+        }
+        home_sw_active = H[joint_num].home_sw;
+        if (H[joint_num].home_state != HOME_IDLE) {
+            homing_flag = 1; /* at least one joint is homing */
+        }
+
+        /* when an joint is homing, 'check_for_faults()' ignores its limit
+           switches, so that this code can do the right thing with them. Once
+           the homing process is finished, the 'check_for_faults()' resumes
+           checking */
+
+        /* homing state machine */
+
+        /* Some portions of the homing sequence can run thru two or more
+           states during a single servo period.  This is done using
+           'immediate_state'.  If a state transition sets it true (non-zero),
+           this 'do-while' will loop executing switch(home_state) immediately
+           to run the new state code.  Otherwise, the loop will fall thru, and
+           switch(home_state) runs only once per servo period. Do _not_ set
+           'immediate_state' true unless you also change 'home_state', unless
+           you want an infinite loop! */
+        do {
+            immediate_state = 0;
+            switch (H[joint_num].home_state) {
+            case HOME_IDLE:
+                /* nothing to do */
+                break;
+
+            case HOME_START:
+                /* This state is responsible for getting the homing process
+                   started.  It doesn't actually do anything, it simply
+                   determines what state is next */
+                if (H[joint_num].home_flags & HOME_IS_SHARED && home_sw_active) {
+                    rtapi_print_msg(RTAPI_MSG_ERR, ("Cannot home while shared home switch is closed j=%d"),
+                                    joint_num);
+                    H[joint_num].home_state = HOME_IDLE;
+                    break;
+                }
+                /* set flags that communicate with the rest of EMC */
+                if (   (H[joint_num].home_flags & HOME_NO_REHOME)
+                    &&  H[joint_num].homed
+                   ) {
+                   H[joint_num].home_state = HOME_IDLE;
+                   break; //no rehome allowed if absolute_enoder
+                } else {
+                    H[joint_num].homing = 1;
+                    H[joint_num].homed = 0;
+                }
+                /* stop any existing motion */
+                joint->free_tp.enable = 0;
+                /* reset delay counter */
+                H[joint_num].pause_timer = 0;
+                /* figure out exactly what homing sequence is needed */
+                if (H[joint_num].home_flags & HOME_ABSOLUTE_ENCODER) {
+                    H[joint_num].home_flags &= ~HOME_IS_SHARED; // shared not applicable
+                    H[joint_num].home_state = HOME_SET_SWITCH_POSITION;
+                    immediate_state = 1;
+                    // Note: H[joint_num].homed
+                    // is not set in case there is a final move requested
+                    break;
+                }
+                if (H[joint_num].home_flags & HOME_UNLOCK_FIRST) {
+                    H[joint_num].home_state = HOME_UNLOCK;
+                } else {
+                    H[joint_num].home_state = HOME_UNLOCK_WAIT;
+                    immediate_state = 1;
+                }
+                break;
+            case HOME_CIA402_START:
+                break;
+            case HOME_CIA402_CONFIRM:
+                break;
+            case HOME_CIA402_WAIT:     
+                break;  
+            case HOME_UNLOCK:
+                // unlock now
+                SetRotaryUnlock(joint_num, 1);
+                H[joint_num].home_state = HOME_UNLOCK_WAIT;
+                break;
+
+            case HOME_UNLOCK_WAIT:
+                // if not yet unlocked, continue waiting
+                if ((H[joint_num].home_flags & HOME_UNLOCK_FIRST) &&
+                    !GetRotaryIsUnlocked(joint_num)) break;
+
+                // either we got here without an unlock needed, or the
+                // unlock is now complete.
+                if (H[joint_num].home_search_vel == 0.0) {
+                    if (H[joint_num].home_latch_vel == 0.0) {
+                        /* both vels == 0 means home at current position */
+                        H[joint_num].home_state = HOME_SET_SWITCH_POSITION;
+                        immediate_state = 1;
+                    } else if (H[joint_num].home_flags & HOME_USE_INDEX) {
+                        /* home using index pulse only */
+                        H[joint_num].home_state = HOME_INDEX_ONLY_START;
+                        immediate_state = 1;
+                    } else {
+                        rtapi_print_msg(RTAPI_MSG_ERR,
+                             ("invalid homing config: non-zero LATCH_VEL needs either SEARCH_VEL or USE_INDEX"));
+                        H[joint_num].home_state = HOME_IDLE;
+                    }
+                } else {
+                    if (H[joint_num].home_latch_vel != 0.0) {
+                        /* need to find home switch */
+                        H[joint_num].home_state = HOME_INITIAL_SEARCH_START;
+                        immediate_state = 1;
+                    } else {
+                        rtapi_print_msg(RTAPI_MSG_ERR,
+                             ("invalid homing config: non-zero SEARCH_VEL needs LATCH_VEL"));
+                        H[joint_num].home_state = HOME_IDLE;
+                    }
+                }
+                break;
+
+            case HOME_INITIAL_BACKOFF_START:
+                /* This state is called if the homing sequence starts at a
+                   location where the home switch is already tripped. It
+                   starts a move away from the switch. */
+                /* is the joint still moving? */
+                if (joint->free_tp.active) {
+                    /* yes, reset delay, wait until joint stops */
+                    H[joint_num].pause_timer = 0;
+                    break;
+                }
+                /* has delay timed out? */
+                if (H[joint_num].pause_timer < (HOME_DELAY * servo_freq)) {
+                    /* no, update timer and wait some more */
+                    H[joint_num].pause_timer++;
+                    break;
+                }
+                H[joint_num].pause_timer = 0;
+                /* set up a move at '-search_vel' to back off of switch */
+                home_start_move(joint, - H[joint_num].home_search_vel);
+                /* next state */
+                H[joint_num].home_state = HOME_INITIAL_BACKOFF_WAIT;
+                break;
+
+            case HOME_INITIAL_BACKOFF_WAIT:
+                /* This state is called while the machine is moving off of
+                   the home switch.  It terminates when the switch is cleared
+                   successfully.  If the move ends or hits a limit before it
+                   clears the switch, the home is aborted. */
+                /* are we off home switch yet? */
+                if (! home_sw_active) {
+                    /* yes, stop motion */
+                    joint->free_tp.enable = 0;
+                    /* begin initial search */
+                    H[joint_num].home_state = HOME_INITIAL_SEARCH_START;
+                    immediate_state = 1;
+                    break;
+                }
+                home_do_moving_checks(joint,joint_num);
+                break;
+
+            case HOME_INITIAL_SEARCH_START:
+                /* This state is responsible for starting a move toward the
+                   home switch.  This move is at 'search_vel', which can be
+                   fairly fast, because once the switch is found another
+                   slower move will be used to set the exact home position. */
+                /* is the joint already moving? */
+                if (joint->free_tp.active) {
+                    /* yes, reset delay, wait until joint stops */
+                    H[joint_num].pause_timer = 0;
+                    break;
+                }
+                /* has delay timed out? */
+                if (H[joint_num].pause_timer < (HOME_DELAY * servo_freq)) {
+                    /* no, update timer and wait some more */
+                    H[joint_num].pause_timer++;
+                    break;
+                }
+                H[joint_num].pause_timer = 0;
+                /* make sure we aren't already on home switch */
+                if (home_sw_active) {
+                    /* already on switch, need to back off it first */
+                    H[joint_num].home_state = HOME_INITIAL_BACKOFF_START;
+                    immediate_state = 1;
+                    break;
+                }
+                /* set up a move at 'search_vel' to find switch */
+                home_start_move(joint, H[joint_num].home_search_vel);
+                /* next state */
+                H[joint_num].home_state = HOME_INITIAL_SEARCH_WAIT;
+                break;
+
+            case HOME_INITIAL_SEARCH_WAIT:
+                /* This state is called while the machine is looking for the
+                   home switch.  It terminates when the switch is found.  If
+                   the move ends or hits a limit before it finds the switch,
+                   the home is aborted. */
+                /* have we hit home switch yet? */
+                if (home_sw_active) {
+                    /* yes, stop motion */
+                    joint->free_tp.enable = 0;
+                    /* go to next step */
+                    H[joint_num].home_state = HOME_SET_COARSE_POSITION;
+                    immediate_state = 1;
+                    break;
+                }
+                home_do_moving_checks(joint,joint_num);
+                break;
+
+            case HOME_SET_COARSE_POSITION:
+                /* This state is called after the first time the switch is
+                   found.  At this point, we are approximately home. Although
+                   we will do another slower pass to get the exact home
+                   location, we reset the joint coordinates now so that screw
+                   error comp will be appropriate for this portion of the
+                   screw (previously we didn't know where we were at all). */
+                /* set the current position to 'home_offset' */
+                offset = H[joint_num].home_offset - joint->pos_fb;
+                /* this moves the internal position but does not affect the
+                   motor position */
+                joint->pos_cmd += offset;
+                joint->pos_fb += offset;
+                joint->free_tp.curr_pos += offset;
+                joint->motor_offset -= offset;
+                /* The next state depends on the signs of 'search_vel' and
+                   'latch_vel'.  If they are the same, that means we must
+                   back up, then do the final homing moving the same
+                   direction as the initial search, on a rising edge of the
+                   switch.  If they are opposite, it means that the final
+                   homing will take place on a falling edge as the machine
+                   moves off of the switch. */
+                tmp = H[joint_num].home_search_vel * H[joint_num].home_latch_vel;
+                if (tmp > 0.0) {
+                    /* search and latch vel are same direction */
+                    H[joint_num].home_state = HOME_FINAL_BACKOFF_START;
+                } else {
+                    /* search and latch vel are opposite directions */
+                    H[joint_num].home_state = HOME_FALL_SEARCH_START;
+                }
+                immediate_state = 1;
+                break;
+
+            case HOME_FINAL_BACKOFF_START:
+                /* This state is called once the approximate location of the
+                   switch has been found.  It is responsible for starting a
+                   move that will back off of the switch in preparation for a
+                   final slow move that captures the exact switch location. */
+                /* is the joint already moving? */
+                if (joint->free_tp.active) {
+                    /* yes, reset delay, wait until joint stops */
+                    H[joint_num].pause_timer = 0;
+                    break;
+                }
+                /* has delay timed out? */
+                if (H[joint_num].pause_timer < (HOME_DELAY * servo_freq)) {
+                    /* no, update timer and wait some more */
+                    H[joint_num].pause_timer++;
+                    break;
+                }
+                H[joint_num].pause_timer = 0;
+                /* we should still be on the switch */
+                if (! home_sw_active) {
+                    rtapi_print_msg(RTAPI_MSG_ERR,
+                         ("Home switch inactive before start of backoff move j=%d"),
+                         joint_num);
+                    H[joint_num].home_state = HOME_IDLE;
+                    break;
+                }
+                /* set up a move at '-search_vel' to back off of switch */
+                home_start_move(joint, - H[joint_num].home_search_vel);
+                /* next state */
+                H[joint_num].home_state = HOME_FINAL_BACKOFF_WAIT;
+                break;
+
+            case HOME_FINAL_BACKOFF_WAIT:
+                /* This state is called while the machine is moving off of
+                   the home switch after finding its approximate location.
+                   It terminates when the switch is cleared successfully.  If
+                   the move ends or hits a limit before it clears the switch,
+                   the home is aborted. */
+                /* are we off home switch yet? */
+                if (! home_sw_active) {
+                    /* yes, stop motion */
+                    joint->free_tp.enable = 0;
+                    /* begin final search */
+                    H[joint_num].home_state = HOME_RISE_SEARCH_START;
+                    immediate_state = 1;
+                    break;
+                }
+                home_do_moving_checks(joint,joint_num);
+                break;
+
+            case HOME_RISE_SEARCH_START:
+                /* This state is called to start the final search for the
+                   point where the home switch trips.  It moves at
+                   'latch_vel' and looks for a rising edge on the switch */
+                /* is the joint already moving? */
+                if (joint->free_tp.active) {
+                    /* yes, reset delay, wait until joint stops */
+                    H[joint_num].pause_timer = 0;
+                    break;
+                }
+                /* has delay timed out? */
+                if (H[joint_num].pause_timer < (HOME_DELAY * servo_freq)) {
+                    /* no, update timer and wait some more */
+                    H[joint_num].pause_timer++;
+                    break;
+                }
+                H[joint_num].pause_timer = 0;
+                /* we should still be off of the switch */
+                if (home_sw_active) {
+                    rtapi_print_msg(RTAPI_MSG_ERR, ("Home switch active before start of latch move j=%d"),
+                                    joint_num);
+                    H[joint_num].home_state = HOME_IDLE;
+                    break;
+                }
+                /* set up a move at 'latch_vel' to locate the switch */
+                home_start_move(joint, H[joint_num].home_latch_vel);
+                /* next state */
+                H[joint_num].home_state = HOME_RISE_SEARCH_WAIT;
+                break;
+
+            case HOME_RISE_SEARCH_WAIT:
+                /* This state is called while the machine is moving towards
+                   the home switch on its final, low speed pass.  It
+                   terminates when the switch is detected. If the move ends
+                   or hits a limit before it hits the switch, the home is
+                   aborted. */
+                /* have we hit the home switch yet? */
+                if (home_sw_active) {
+                    /* yes, where do we go next? */
+                    if (H[joint_num].home_flags & HOME_USE_INDEX) {
+                        /* look for index pulse */
+                        H[joint_num].home_state = HOME_INDEX_SEARCH_START;
+                        immediate_state = 1;
+                        break;
+                    } else {
+                        /* no index pulse, stop motion */
+                        joint->free_tp.enable = 0;
+                        /* go to next step */
+                        H[joint_num].home_state = HOME_SET_SWITCH_POSITION;
+                        immediate_state = 1;
+                        break;
+                    }
+                }
+                home_do_moving_checks(joint,joint_num);
+                break;
+
+            case HOME_FALL_SEARCH_START:
+                /* This state is called to start the final search for the
+                   point where the home switch releases.  It moves at
+                   'latch_vel' and looks for a falling edge on the switch */
+                /* is the joint already moving? */
+                if (joint->free_tp.active) {
+                    /* yes, reset delay, wait until joint stops */
+                    H[joint_num].pause_timer = 0;
+                    break;
+                }
+                /* has delay timed out? */
+                if (H[joint_num].pause_timer < (HOME_DELAY * servo_freq)) {
+                    /* no, update timer and wait some more */
+                    H[joint_num].pause_timer++;
+                    break;
+                }
+                H[joint_num].pause_timer = 0;
+                /* we should still be on the switch */
+                if (!home_sw_active) {
+                    rtapi_print_msg(RTAPI_MSG_ERR,
+                         ("Home switch inactive before start of latch move j=%d"),
+                         joint_num);
+                    H[joint_num].home_state = HOME_IDLE;
+                    break;
+                }
+                /* set up a move at 'latch_vel' to locate the switch */
+                home_start_move(joint, H[joint_num].home_latch_vel);
+                /* next state */
+                H[joint_num].home_state = HOME_FALL_SEARCH_WAIT;
+                break;
+
+            case HOME_FALL_SEARCH_WAIT:
+                /* This state is called while the machine is moving away from
+                   the home switch on its final, low speed pass.  It
+                   terminates when the switch is cleared. If the move ends or
+                   hits a limit before it clears the switch, the home is
+                   aborted. */
+                /* have we cleared the home switch yet? */
+                if (!home_sw_active) {
+                    /* yes, where do we go next? */
+                    if (H[joint_num].home_flags & HOME_USE_INDEX) {
+                        /* look for index pulse */
+                        H[joint_num].home_state = HOME_INDEX_SEARCH_START;
+                        immediate_state = 1;
+                        break;
+                    } else {
+                        /* no index pulse, stop motion */
+                        joint->free_tp.enable = 0;
+                        /* go to next step */
+                        H[joint_num].home_state = HOME_SET_SWITCH_POSITION;
+                        immediate_state = 1;
+                        break;
+                    }
+                }
+                home_do_moving_checks(joint,joint_num);
+                break;
+
+            case HOME_SET_SWITCH_POSITION:
+                /* This state is called when the machine has determined the
+                   switch position as accurately as possible.  It sets the
+                   current joint position to 'home_offset', which is the
+                   location of the home switch in joint coordinates. */
+                /* set the current position to 'home_offset' */
+                if (H[joint_num].home_flags & HOME_ABSOLUTE_ENCODER) {
+                    offset = H[joint_num].home_offset;
+                } else {
+                    offset = H[joint_num].home_offset - joint->pos_fb;
+                }
+                /* this moves the internal position but does not affect the
+                   motor position */
+                joint->pos_cmd += offset;
+                joint->pos_fb += offset;
+                joint->free_tp.curr_pos += offset;
+                joint->motor_offset -= offset;
+                if (H[joint_num].home_flags & HOME_ABSOLUTE_ENCODER) {
+                    if (H[joint_num].home_flags & HOME_NO_FINAL_MOVE) {
+                        H[joint_num].home_state = HOME_FINISHED;
+                        immediate_state = 1;
+                        H[joint_num].homed = 1;
+                        break;
+                    }
+                }
+                /* next state */
+                H[joint_num].home_state = HOME_FINAL_MOVE_START;
+                immediate_state = 1;
+                break;
+
+            case HOME_INDEX_ONLY_START:
+                /* This state is used if the machine has been pre-positioned
+                   near the home position, and simply needs to find the
+                   next index pulse.  It starts a move at latch_vel, and
+                   sets index-enable, which tells the encoder driver to
+                   reset its counter to zero and clear the enable when the
+                   next index pulse arrives. */
+                /* is the joint already moving? */
+                if (joint->free_tp.active) {
+                    /* yes, reset delay, wait until joint stops */
+                    H[joint_num].pause_timer = 0;
+                    break;
+                }
+                /* has delay timed out? */
+                if (H[joint_num].pause_timer < (HOME_DELAY * servo_freq)) {
+                    /* no, update timer and wait some more */
+                    H[joint_num].pause_timer++;
+                    break;
+                }
+                H[joint_num].pause_timer = 0;
+                /* Although we don't know the exact home position yet, we
+                   we reset the joint coordinates now so that screw error
+                   comp will be appropriate for this portion of the screw
+                   (previously we didn't know where we were at all). */
+                /* set the current position to 'home_offset' */
+                offset = H[joint_num].home_offset - joint->pos_fb;
+                /* this moves the internal position but does not affect the
+                   motor position */
+                joint->pos_cmd += offset;
+                joint->pos_fb += offset;
+                joint->free_tp.curr_pos += offset;
+                joint->motor_offset -= offset;
+                /* set the index enable */
+                H[joint_num].index_enable = 1;
+                /* set up a move at 'latch_vel' to find the index pulse */
+                home_start_move(joint, H[joint_num].home_latch_vel);
+                /* next state */
+                H[joint_num].home_state = HOME_INDEX_SEARCH_WAIT;
+                break;
+
+            case HOME_INDEX_SEARCH_START:
+                /* This state is called after the machine has made a low
+                   speed pass to determine the limit switch location. It
+                   sets index-enable, which tells the encoder driver to
+                   reset its counter to zero and clear the enable when the
+                   next index pulse arrives. */
+                /* set the index enable */
+                H[joint_num].index_enable = 1;
+                /* and move right into the waiting state */
+                H[joint_num].home_state = HOME_INDEX_SEARCH_WAIT;
+                immediate_state = 1;
+                home_do_moving_checks(joint,joint_num);
+                break;
+
+            case HOME_INDEX_SEARCH_WAIT:
+                /* This state is called after the machine has found the
+                   home switch and "armed" the encoder counter to reset on
+                   the next index pulse. It continues at low speed until
+                   an index pulse is detected, at which point it sets the
+                   final home position.  If the move ends or hits a limit
+                   before an index pulse occurs, the home is aborted. */
+                /* has an index pulse arrived yet? encoder driver clears
+                   enable when it does */
+                if ( H[joint_num].index_enable == 0 ) {
+                    /* yes, stop motion */
+                    joint->free_tp.enable = 0;
+                    /* go to next step */
+                    H[joint_num].home_state = HOME_SET_INDEX_POSITION;
+                    immediate_state = 1;
+                    break;
+                }
+                home_do_moving_checks(joint,joint_num);
+                break;
+
+            case HOME_SET_INDEX_POSITION:
+                /* This state is called when the encoder has been reset at
+                   the index pulse position.  It sets the current joint
+                   position to 'home_offset', which is the location of the
+                   index pulse in joint coordinates. */
+                /* set the current position to 'home_offset' */
+                joint->motor_offset = - H[joint_num].home_offset;
+                joint->pos_fb = joint->motor_pos_fb -
+                    (joint->backlash_filt + joint->motor_offset);
+                joint->pos_cmd = joint->pos_fb;
+                joint->free_tp.curr_pos = joint->pos_fb;
+
+                if (H[joint_num].home_flags & HOME_INDEX_NO_ENCODER_RESET) {
+                   /* Special case: encoder does not reset on index pulse.
+                      This moves the internal position but does not affect
+                      the motor position */
+                   offset = H[joint_num].home_offset - joint->pos_fb;
+                   joint->pos_cmd          += offset;
+                   joint->pos_fb           += offset;
+                   joint->free_tp.curr_pos += offset;
+                   joint->motor_offset     -= offset;
+                }
+
+                /* next state */
+                H[joint_num].home_state = HOME_FINAL_MOVE_START;
+                immediate_state = 1;
+                break;
+
+            case HOME_FINAL_MOVE_START:
+                /* This state is called once the joint coordinate system is
+                   set properly.  It moves to the actual 'home' position,
+                   which is not necessarily the position of the home switch
+                   or index pulse. */
+                /* is the joint already moving? */
+                if (joint->free_tp.active) {
+                    /* yes, reset delay, wait until joint stops */
+                    H[joint_num].pause_timer = 0;
+                    break;
+                }
+                /* has delay timed out? */
+                if (H[joint_num].pause_timer < (HOME_DELAY * servo_freq)) {
+                    /* no, update timer and wait some more */
+                    H[joint_num].pause_timer++;
+                    if (H[joint_num].home_sequence < 0) {
+                        if (!H[home_sequence].sync_final_move) break;
+                    } else {
+                        break;
+                    }
+
+                }
+                // negative H[joint_num].home_sequence means sync final move
+                //          defer final move until all joints in sequence are ready
+                if  (        (H[joint_num].home_sequence  < 0)
+                     && ( ABS(H[joint_num].home_sequence) == home_sequence)
+                    ) {
+                    if (!H[home_sequence].sync_final_move) {
+                        int jno;
+                        emcmot_joint_t *jtmp;
+                        H[home_sequence].sync_final_move = 1; //disprove
+                        for (jno = 0; jno < all_joints; jno++) {
+                            jtmp = &joints[jno];
+                            if (!H[jno].joint_in_sequence) continue;
+                            if (ABS(H[jno].home_sequence) != home_sequence) {continue;}
+                            if (H[jno].home_flags & HOME_ABSOLUTE_ENCODER)  {continue;}
+                            if (   (H[jno].home_state != HOME_FINAL_MOVE_START)
+                                ||
+                                   (jtmp->free_tp.active)
+                                ) {
+                                H[home_sequence].sync_final_move = 0;
+                                break;
+                            }
+                        }
+                        if (!H[home_sequence].sync_final_move) break;
+                    }
+                }
+                H[joint_num].pause_timer = 0;
+                /* plan a move to home position */
+                joint->free_tp.pos_cmd = H[joint_num].home;
+                /* if home_vel is set (>0) then we use that, otherwise we rapid there */
+                if (H[joint_num].home_final_vel > 0) {
+                    joint->free_tp.max_vel = fabs(H[joint_num].home_final_vel);
+                    /* clamp on max vel for this joint */
+                    if (joint->free_tp.max_vel > joint->vel_limit)
+                        joint->free_tp.max_vel = joint->vel_limit;
+                } else {
+                    joint->free_tp.max_vel = joint->vel_limit;
+                }
+                /* start the move */
+                joint->free_tp.enable = 1;
+                H[joint_num].home_state = HOME_FINAL_MOVE_WAIT;
+                break;
+
+            case HOME_FINAL_MOVE_WAIT:
+                /* This state is called while the machine makes its final
+                   move to the home position.  It terminates when the machine
+                   arrives at the final location. If the move hits a limit
+                   before it arrives, the home is aborted. */
+                /* have we arrived (and stopped) at home? */
+                if (!joint->free_tp.active) {
+                    /* yes, stop motion */
+                    joint->free_tp.enable = 0;
+                    /* we're finally done */
+                    H[joint_num].home_state = HOME_LOCK;
+                    immediate_state = 1;
+                    break;
+                }
+                if (joint->on_pos_limit || joint->on_neg_limit) {
+                    /* on limit, check to see if we should trip */
+                    if (!(H[joint_num].home_flags & HOME_IGNORE_LIMITS)) {
+                        /* not ignoring limits, time to quit */
+                        rtapi_print_msg(RTAPI_MSG_ERR, ("hit limit in home state j=%d"),joint_num);
+                        H[joint_num].home_state = HOME_ABORT;
+                        immediate_state = 1;
+                        break;
+                    }
+                }
+                break;
+
+            case HOME_LOCK:
+                if (H[joint_num].home_flags & HOME_UNLOCK_FIRST) {
+                    SetRotaryUnlock(joint_num, 0);
+                } else {
+                    immediate_state = 1;
+                }
+                H[joint_num].home_state = HOME_LOCK_WAIT;
+                break;
+
+            case HOME_LOCK_WAIT:
+                // if not yet locked, continue waiting
+                if ((H[joint_num].home_flags & HOME_UNLOCK_FIRST) &&
+                    GetRotaryIsUnlocked(joint_num)) break;
+
+                // either we got here without a lock needed, or the
+                // lock is now complete.
+                H[joint_num].home_state = HOME_FINISHED;
+                immediate_state = 1;
+                break;
+
+            case HOME_FINISHED:
+                H[joint_num].homing = 0;
+                H[joint_num].homed = 1;
+                H[joint_num].home_state = HOME_IDLE;
+                immediate_state = 1;
+                H[joint_num].joint_in_sequence = 0;
+                // This joint just finished homing.  See if this is the
+                // final one and all joints are now homed, and switch to
+                // Teleop mode if so.
+                if (get_allhomed()) {
+                    allhomed = 1;
+                }
+                break;
+
+            case HOME_ABORT:
+                H[joint_num].homing = 0;
+                H[joint_num].homed = 0;
+                H[joint_num].joint_in_sequence = 0;
+                joint->free_tp.enable = 0;
+                H[joint_num].home_state = HOME_IDLE;
+                H[joint_num].index_enable = 0;
+                immediate_state = 1;
+                break;
+
+            default:
+                /* should never get here */
+                rtapi_print_msg(RTAPI_MSG_ERR, ("unknown state '%d' during homing j=%d"),
+                                H[joint_num].home_state,joint_num);
+                H[joint_num].home_state = HOME_ABORT;
+                immediate_state = 1;
+                break;
+            }        /* end of switch(H[joint_num].home_state) */
+        } while (immediate_state);
+    }        /* end of loop through all joints */
+
+    if ( homing_flag ) {
+        /* at least one joint is homing, set global flag */
+        homing_active = 1;
+    } else {
+        /* is a homing sequence in progress? */
+        if (sequence_state == HOME_SEQUENCE_IDLE) {
+            /* no, single joint only, we're done */
+            homing_active = 0;
+        }
+    }
+    if (allhomed) {homing_active = 0; return 1;}
+    return 0;
+} // do_homing()
 //========================================================
 // all home functions for homing api
 EXPORT_SYMBOL(homeMotFunctions);
-EXPORT_SYMBOL(homeMotData);
 
+EXPORT_SYMBOL(homing_init);
 EXPORT_SYMBOL(do_homing);
-EXPORT_SYMBOL(do_homing_sequence);
 EXPORT_SYMBOL(get_allhomed);
 EXPORT_SYMBOL(get_homed);
 EXPORT_SYMBOL(get_home_is_idle);
 EXPORT_SYMBOL(get_home_is_synchronized);
-EXPORT_SYMBOL(get_home_is_volatile);
 EXPORT_SYMBOL(get_home_needs_unlock_first);
 EXPORT_SYMBOL(get_home_sequence);
-EXPORT_SYMBOL(get_home_sequence_state);
 EXPORT_SYMBOL(get_homing);
 EXPORT_SYMBOL(get_homing_at_index_search_wait);
 EXPORT_SYMBOL(get_homing_is_active);
 EXPORT_SYMBOL(get_index_enable);
-EXPORT_SYMBOL(homing_init);
 EXPORT_SYMBOL(read_homing_in_pins);
-EXPORT_SYMBOL(set_home_abort);
-EXPORT_SYMBOL(set_home_idle);
-EXPORT_SYMBOL(set_home_sequence_state);
-EXPORT_SYMBOL(set_home_start);
-EXPORT_SYMBOL(set_joint_at_home);
-EXPORT_SYMBOL(set_joint_homed);
-EXPORT_SYMBOL(set_joint_homing);
+EXPORT_SYMBOL(do_home_joint);
+EXPORT_SYMBOL(do_cancel_homing);
+EXPORT_SYMBOL(set_unhomed);
 EXPORT_SYMBOL(set_joint_homing_params);
 EXPORT_SYMBOL(update_joint_homing_params);
 EXPORT_SYMBOL(write_homing_out_pins);
