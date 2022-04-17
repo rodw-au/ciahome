@@ -1,4 +1,4 @@
-component homecomp1"homing module template";
+component ciahome "homing module template";
 
 description """
 Example of a homing module buildable with halcompile.
@@ -38,6 +38,8 @@ option  extra_setup;
 #include "motion.h"
 #include "homing.h"
 #include "math.h"
+#include "time.h"
+
 #define ABS(x) (((x) < 0) ? -(x) : (x))
 #define MAX_HOME_SEQUENCES EMCMOT_MAX_JOINTS
 /* Length of delay between homing motions - this is intended to
@@ -45,6 +47,13 @@ option  extra_setup;
    ended.  We might want to make this user adjustable, but for
    now it's a constant.  It is in seconds */
 #define HOME_DELAY 0.100
+//constants
+#define FAULT_AUTORESET_DELAY_NS 100000000LL
+#define OPMODE_CYCLIC_POSITION 8
+#define OPMODE_CYCLIC_VELOCITY 9
+#define OPMODE_HOMING 6
+#define OPMODE_NONE 0
+
 static char *home_parms;
 RTAPI_MP_STRING(home_parms,"Example home parms");
 
@@ -128,7 +137,7 @@ typedef enum {
 } home_state_t;
 
 static int  immediate_state;
-
+static clock_t last_time = 0;
 
 //local data
 //CIA Control Word
@@ -148,7 +157,7 @@ typedef union
     unsigned char bit9            : 1;  // 09 not used in any mode
     unsigned char keep            : 6;  // 10-15 not used in any mode
   }b;
-    unsigned int Word;
+    hal_u32_t Word;
 }Control_t;
 
 //CIA Status Word
@@ -166,7 +175,7 @@ typedef union
     unsigned char Warning          : 1;  // 07
     unsigned char keep1            : 1;  // 08
     unsigned char Remote           : 1;  // 09
-    unsigned char TargetReached    : 1;  // 10
+    hal_bit_t     TargetReached    : 1;  // 10
     unsigned char bit11            : 1;  // 11
     unsigned char bit12            : 1;  // 12
     unsigned char keep2            : 3;  // 13-15
@@ -191,11 +200,11 @@ typedef struct {
 	
 	// CIA402 pins
 	hal_u32_t statusword;       // IN  - Drives CiA402 Statusword, index 0x6041
-	signed opmode_display;      // IN  - Drives Modes of Operation feedback register, index 0x6061
+	hal_u32_t opmode_display;   // IN  - Drives Modes of Operation feedback register, index 0x6061
 	signed drv_actual_position; // IN  - Drives actual Position, index 0x6064
 	signed drv_actual_velocity; // IN  - Drives actual Velocity, index 0x606C 
-	unsigned controlword;       // OUT - Drives CIA402 Controlword, index 0x6040
-	signed opmode;              // OUT - Drives Modes of Operation Input, index 0x6060
+	hal_u32_t controlword;      // OUT - Drives CIA402 Controlword, index 0x6040
+	hal_u32_t opmode;           // OUT - Drives Modes of Operation Input, index 0x6060
 	signed drv_target_position; // OUT - Position command to the drive, index 0x607A
 	signed drv_target_velocity; // OUT - Velocity command to the drive, index 0x60FF
 	
@@ -215,6 +224,23 @@ typedef struct {
 
     Status_t     Status;  		// IN  - CIA Status Word with bitmap (not a pin)
     Control_t    Control; 		// OUT - CIA Control Word with bitmap (not a pin)
+    
+    // additional CIA402 data  
+    hal_float_t cia_pos_scale;      // IN  - CIA scale in Pulses per rev
+    hal_float_t cia_pos_scale_old;
+    double cia_pos_scale_rcpt;
+    hal_float_t cia_velo_scale;
+    hal_float_t cia_velo_scale_old;
+    double cia_velo_scale_rcpt;
+    hal_bit_t  csp_mode;			//IN - true= CS Position Mode, false= CS Velocity Mode, is only recognized at Linuxcnc Startup
+    
+    // Auxilliary pins  
+	hal_bit_t  cia_opmode_no_mode;
+	hal_bit_t  cia_opmode_homing;
+	hal_bit_t  opmode_cyclic_position;
+	hal_bit_t  opmode_cyclic_velocity;
+	hal_bit_t  stat_target_reached;
+	signed auto_fault_reset_delay;
     
     // Inluded for compatibility with homing.c
     int pause_timer;
@@ -249,7 +275,7 @@ typedef struct {
 	signed *drv_actual_position; // IN  - Drives actual Position, index 0x6064
 	signed *drv_actual_velocity; // IN  - Drives actual Velocity, index 0x606C 
 	unsigned *controlword;       // OUT - Drives CIA402 Controlword, index 0x6040
-	signed *opmode;              // OUT - Drives Modes of Operation Input, index 0x6060
+	hal_u32_t *opmode;           // OUT - Drives Modes of Operation Input, index 0x6060
 	signed *drv_target_position; // OUT - Position command to the drive, index 0x607A
 	signed *drv_target_velocity; // OUT - Velocity command to the drive, index 0x60FF
 	
@@ -266,6 +292,27 @@ typedef struct {
     hal_bit_t *cia_home;   		// IO  - true starts the Drives internal home procedure
 	hal_bit_t *stat_homed; 		// OUT - true indicates that the Drive is internaly homed
 	hal_bit_t *stat_homing;		// OUT - true indicates that the Drives homing procedure is running
+
+    // Additional cia402 data
+    hal_float_t *cia_pos_scale;        // IN - scale in Pulses per rev  
+    hal_float_t *cia_pos_scale_old;
+    double *cia_pos_scale_rcpt;
+    hal_float_t *cia_velo_scale;
+    hal_float_t *cia_velo_scale_old;
+    double *cia_velo_scale_rcpt;
+	hal_bit_t  *csp_mode;			//IN - true= CS Position Mode, false= CS Velocity Mode, is only recognized at Linuxcnc Startup  
+	
+	// Auxilliary pins  
+	hal_bit_t  *cia_opmode_no_mode;
+	hal_bit_t  *cia_opmode_homing;
+	hal_bit_t  *opmode_cyclic_position;
+	hal_bit_t  *opmode_cyclic_velocity;
+	hal_bit_t  *stat_target_reached;
+	signed     *auto_fault_reset_delay; // IN  - Reset Delay
+	
+	//Debug Pins
+	hal_u32_t *dbgControlWord;
+	hal_u32_t *dbgStatusWord;	
 	
 } one_joint_home_data_t;
 
@@ -276,6 +323,22 @@ typedef struct {
 } all_joints_home_data_t;
 
 static all_joints_home_data_t *joint_home_data = 0;
+
+void check_scales(hal_float_t *scale,hal_float_t *scale_old, double *scale_rcpt) {
+  // check for change in scale value
+  if (*scale != *scale_old) {
+    // scale value has changed, test and update it
+    if ((*scale < 1e-20) && (*scale > -1e-20)) {
+      // value too small, divide by zero is a bad thing
+      *scale = 1.0;
+    }
+    // save new scale to detect future changes
+    *scale_old = *scale;
+    // we actually want the reciprocal
+    *scale_rcpt = 1.0 / *scale;
+  }
+}
+ 
 
 static int makepins(int id,int njoints)
 {
@@ -338,8 +401,36 @@ static int makepins(int id,int njoints)
         retval += hal_pin_bit_newf(HAL_OUT, &(addr->stat_homed), id,
                                   "joint.%d.cia-stat-homed", jno);
         retval += hal_pin_bit_newf(HAL_OUT, &(addr->stat_homing), id,
-                                  "joint.%d.cia-stat-homing", jno);
+                                  "joint.%d.cia-stat-homing", jno);                                                                                                                    
+		retval += hal_pin_bit_newf(HAL_IN, &(addr->csp_mode), id,
+                                  "joint.%d.cia-csp-mode", jno);
+        retval += hal_pin_float_newf(HAL_OUT, (volatile double **)&(addr->cia_pos_scale), id,
+                                  "joint.%d.cia-pos_scale", jno);                                  
+		retval += hal_pin_bit_newf(HAL_OUT, &(addr->cia_opmode_no_mode), id,
+                                  "joint.%d.cia-pmode-no-mode", jno);
+		retval += hal_pin_bit_newf(HAL_OUT, &(addr->cia_opmode_homing), id,
+                                  "joint.%d.cia-opmode-homing", jno);
+		retval += hal_pin_bit_newf(HAL_OUT, &(addr->opmode_cyclic_position), id,
+                                  "joint.%d.cia-opmode-cyclic-position", jno);
+		retval += hal_pin_bit_newf(HAL_OUT, &(addr->opmode_cyclic_velocity), id,
+                                  "joint.%d.opmode-cyclic-velocity", jno);
+		retval += hal_pin_bit_newf(HAL_OUT, &(addr->stat_target_reached), id,
+                                  "joint.%d.cia-stat-target-reached", jno);
+       retval += hal_pin_u32_newf(HAL_OUT, &(addr->dbgControlWord), id,
+                                  "joint.%d.cia-dbgControlWord", jno);                                  
+       retval += hal_pin_u32_newf(HAL_OUT, &(addr->dbgStatusWord), id,
+                                  "joint.%d.cia-dbgStatusWord", jno);   
+       retval += hal_pin_s32_newf(HAL_OUT, &(addr->tperiod), id,
+                                  "joint.%d.cia-period", jno);  
+        
 
+	// Auxilliary pins  
+	hal_bit_t  *cia_opmode_no_mode;
+	hal_bit_t  *cia_opmode_homing;
+	hal_bit_t  *opmode_cyclic_position;
+	hal_bit_t  *opmode_cyclic_velocity;
+
+                                  
     }
     return retval;
 }
@@ -550,6 +641,15 @@ void read_homing_in_pins(int njoints)
 {
   int jno; 
   one_joint_home_data_t *addr;
+  clock_t t_period;  // period between call in clocks
+  float f_period;    // period in seconds
+  clock_t period;    // we need to make our own period variable as it does not exist in this kind of component
+  
+  t_period = clock() - last_time;
+  period = t_period * (CLOCKS_PER_SEC / 1e+9);  // convert to nanoseconds
+  f_period = (float)t_period * ((float) t_period/(float)CLOCKS_PER_SEC);
+  last_time += t_period;
+  
   for (jno = 0; jno < njoints; jno++) {
     addr = &(joint_home_data->jhd[jno]);
 	H[jno].home_sw      = *(addr->home_sw);      // IN
@@ -563,6 +663,40 @@ void read_homing_in_pins(int njoints)
 	H[jno].pos_cmd = *(addr->cia_pos_cmd);                     // IN - target Position, from Motion or PID	
 	H[jno].velocity_cmd = *(addr->cia_velocity_cmd);           // IN - target Velocity, from Motion or PID
     H[jno].cia_home      = *(addr->cia_home);                  // IO - true starts the Drives internal home procedure
+    H[jno].cia_pos_scale    = *(addr->cia_pos_scale);          // IN - Joint Scale in pulses per revolution
+    check_scales(&H[jno].cia_pos_scale, &H[jno].cia_pos_scale_old, &H[jno].cia_pos_scale_rcpt);
+    check_scales(&H[jno].cia_velo_scale, &H[jno].cia_velo_scale_old, &H[jno].cia_velo_scale_rcpt);
+    // read position feedback
+    H[jno].pos_fb = ((double) H[jno].drv_actual_position) *  H[jno].cia_pos_scale_rcpt;
+
+    // read velocity feedback
+    H[jno].velocity_fb = ((double)H[jno].drv_actual_velocity) * H[jno].cia_velo_scale_rcpt;
+    // read Modes of Operation
+    H[jno].cia_opmode_no_mode = (H[jno].opmode_display == OPMODE_NONE);
+    H[jno].cia_opmode_homing = (H[jno].opmode_display == OPMODE_HOMING);
+    H[jno].opmode_cyclic_velocity = (H[jno].opmode_display == OPMODE_CYCLIC_VELOCITY);
+    H[jno].opmode_cyclic_position = (H[jno].opmode_display == OPMODE_CYCLIC_POSITION);
+    if (H[jno].opmode_cyclic_position || H[jno].opmode_cyclic_velocity) {
+      //H[jno].stat_target_reached = (H[jno].statusword >> 10) & 1; 
+      H[jno].stat_target_reached = H[jno].Status.b.TargetReached;
+    } else {
+       H[jno].stat_target_reached = 0;
+    }
+    //home states  
+    if (H[jno].cia_opmode_homing) {
+      //stat_homed    = ((H[jno].cia-statusword >> 10) & 1) && ((statusword >> 12) & 1);
+      H[jno].stat_homed  = (H[jno].Status.b.TargetReached  && H[jno].Status.b.bit12);
+      // stat_homing   = !H[jno].stat_homed && !((H[jno].statusword >> 10) & 1);
+      H[jno].stat_homing   = !H[jno].stat_homed && !((H[jno].Status.b.TargetReached));
+      H[jno].auto_fault_reset_delay =  *(addr->auto_fault_reset_delay);   // IN  
+    }
+    // update fault output
+    if (H[jno].auto_fault_reset_delay > 0) {
+      H[jno].auto_fault_reset_delay -= period;
+      H[jno].Status.b.Fault = 0;
+    } else {
+      H[jno].drv_fault = H[jno].Status.b.Fault  && H[jno].enable;
+    }  
   }
   return;
 }
@@ -676,6 +810,8 @@ void write_homing_out_pins(int njoints)
         *(addr->stat_homed) = H[jno].stat_homed;       // OUT 
         *(addr->stat_homing) = H[jno].stat_homing;     // OUT
         *(addr->tperiod)      = H[jno].tperiod;        // OUT - delete me for testing only
+        *(addr->dbgControlWord)  = H[jno].Control.Word; // OUT - Debug, check it is working 
+        *(addr->dbgStatusWord)  = H[jno].Status.Word;   // OUT - Debug, check it is working         
     }
     return;
 }
