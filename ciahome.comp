@@ -233,14 +233,19 @@ typedef struct {
     hal_float_t cia_velo_scale_old;
     double cia_velo_scale_rcpt;
     hal_bit_t  csp_mode;			//IN - true= CS Position Mode, false= CS Velocity Mode, is only recognized at Linuxcnc Startup
-    
+    bool       enable_edge;         //NA - used in write_homing_out_pins() to detect edge
+    bool       old_enable_edge;
+    bool       pos_mode;
+    bool       init_pos_mode;
     // Auxilliary pins  
 	hal_bit_t  cia_opmode_no_mode;
 	hal_bit_t  cia_opmode_homing;
 	hal_bit_t  opmode_cyclic_position;
 	hal_bit_t  opmode_cyclic_velocity;
 	hal_bit_t  stat_target_reached;
-	signed auto_fault_reset_delay;
+    hal_bit_t  fault_reset; // IN  - Reset
+    hal_bit_t  auto_fault_reset;
+	signed     auto_fault_reset_delay;
     
     // Inluded for compatibility with homing.c
     int pause_timer;
@@ -299,15 +304,20 @@ typedef struct {
     double *cia_pos_scale_rcpt;
     hal_float_t *cia_velo_scale;
     hal_float_t *cia_velo_scale_old;
-    double *cia_velo_scale_rcpt;
-	hal_bit_t  *csp_mode;			//IN - true= CS Position Mode, false= CS Velocity Mode, is only recognized at Linuxcnc Startup  
-	
+    double      *cia_velo_scale_rcpt;
+	hal_bit_t  *csp_mode;			//IN - true= CS Position Mode, false= CS Velocity Mode, is only recognized at Linuxcnc Startup 
+	int        *enable_edge; 
+    int        *old_enable_edge;	
+    int        *init_pos_mode;	
+    
 	// Auxilliary pins  
 	hal_bit_t  *cia_opmode_no_mode;
 	hal_bit_t  *cia_opmode_homing;
 	hal_bit_t  *opmode_cyclic_position;
 	hal_bit_t  *opmode_cyclic_velocity;
 	hal_bit_t  *stat_target_reached;
+	hal_bit_t  *fault_reset; // IN  - Reset 
+	hal_bit_t  *auto_fault_reset;	
 	signed     *auto_fault_reset_delay; // IN  - Reset Delay
 	
 	//Debug Pins
@@ -404,8 +414,8 @@ static int makepins(int id,int njoints)
                                   "joint.%d.cia-stat-homing", jno);                                                                                                                    
 		retval += hal_pin_bit_newf(HAL_IN, &(addr->csp_mode), id,
                                   "joint.%d.cia-csp-mode", jno);
-        retval += hal_pin_float_newf(HAL_OUT, (volatile double **)&(addr->cia_pos_scale), id,
-                                  "joint.%d.cia-pos_scale", jno);                                  
+        retval += hal_pin_float_newf(HAL_IN, (volatile double **)&(addr->cia_pos_scale), id,
+                                  "joint.%d.cia-pos-scale", jno);                                  
 		retval += hal_pin_bit_newf(HAL_OUT, &(addr->cia_opmode_no_mode), id,
                                   "joint.%d.cia-pmode-no-mode", jno);
 		retval += hal_pin_bit_newf(HAL_OUT, &(addr->cia_opmode_homing), id,
@@ -420,8 +430,7 @@ static int makepins(int id,int njoints)
                                   "joint.%d.cia-dbgControlWord", jno);                                  
        retval += hal_pin_u32_newf(HAL_OUT, &(addr->dbgStatusWord), id,
                                   "joint.%d.cia-dbgStatusWord", jno);   
-       retval += hal_pin_s32_newf(HAL_OUT, &(addr->tperiod), id,
-                                  "joint.%d.cia-period", jno);  
+ 
         
 
 	// Auxilliary pins  
@@ -564,9 +573,9 @@ int  homing_init(int id,
         H[i].home_offset     =  0;
         H[i].home            =  0;
         H[i].home_flags      =  0;
-        H[i].home_sequence   = 1000; //startup: unrealizable, positive seq no.
+        H[i].home_sequence   =  1000; //startup: unrealizable, positive seq no.
         H[i].volatile_home   =  0;
-
+        H[i].init_pos_mode   =  0;
     }
     return 0;
 }
@@ -790,8 +799,49 @@ void write_homing_out_pins(int njoints)
 {
     int jno;
     one_joint_home_data_t *addr;
+    
     for (jno = 0; jno < njoints; jno++) {
-        H[jno].tperiod += 1;
+		//init opmode
+		if (!H[jno].init_pos_mode) {
+		  H[jno].pos_mode = H[jno].csp_mode;
+		  H[jno].init_pos_mode = 1;
+		}
+		
+		// detect enable edge
+		H[jno].enable_edge = H[jno].enable && !H[jno].old_enable_edge;
+		H[jno].old_enable_edge = H[jno].enable;
+		H[jno].Control.b.QuickStop = 1;  // Quickstop is not supported
+		if(H[jno].Status.b.Fault){
+			H[jno].home = 0;
+			if (H[jno].fault_reset) {
+				//controlword |= (1 << 7); // fault reset
+				H[jno].Control.b.Faultreset = 1;
+			}
+			if (H[jno].auto_fault_reset && H[jno].enable_edge) {
+			  H[jno].auto_fault_reset_delay = FAULT_AUTORESET_DELAY_NS;
+			  //controlword |= (1 << 7); // fault reset
+			  H[jno].Control.b.Faultreset = 1;
+			}			
+		} else {
+			if (H[jno].enable) {
+			  H[jno].Control.b.EnableVoltage = 1;
+			  if (H[jno].Status.b.ReadyToSwitchOn) {
+				H[jno].Control.b.SwitchOn = 1;
+				if (H[jno].Status.b. SwitchOn) {
+				  H[jno].Control.b.EnableOperation;
+				}
+			  }
+			}
+		}
+	    // write position command
+	    H[jno].drv_target_position = (int32_t) (H[jno].pos_cmd * H[jno].cia_pos_scale);
+	    
+        // write velocity command
+        H[jno].drv_target_velocity = (int32_t) (H[jno].velocity_cmd * H[jno].cia_velo_scale);
+        
+        // reset home command 
+        //  TO DO
+        H[jno].tperiod += 1;  // dummy test DELETE ME
         addr = &(joint_home_data->jhd[jno]);
         *(addr->homing)       = H[jno].homing;         // OUT
         *(addr->homed)        = H[jno].homed;          // OUT
@@ -809,7 +859,7 @@ void write_homing_out_pins(int njoints)
         *(addr->cia_home) = H[jno].cia_home; // OUT 
         *(addr->stat_homed) = H[jno].stat_homed;       // OUT 
         *(addr->stat_homing) = H[jno].stat_homing;     // OUT
-        *(addr->tperiod)      = H[jno].tperiod;        // OUT - delete me for testing only
+        *(addr->tperiod)      = H[jno].tperiod;        // OUT  - delete me for testing only
         *(addr->dbgControlWord)  = H[jno].Control.Word; // OUT - Debug, check it is working 
         *(addr->dbgStatusWord)  = H[jno].Status.Word;   // OUT - Debug, check it is working         
     }
