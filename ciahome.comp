@@ -27,6 +27,7 @@ or by inifile setting: \\fB[EMCMOT]HOMEMOD=user_homecomp\\fR
 2) This source file for BRANCHNAME (master,2.9,etc) is downloadable from github:\n
 https://github.com/LinuxCNC/linuxcnc/blob/BRANCHNAME/src/hal/components/homecomp.comp
 """;
+// sudo chmod 666 /dev/EtherCAT0
 
 pin out bit is_module=1; //one pin is required to use halcompile)
 
@@ -235,8 +236,8 @@ typedef struct {
     hal_bit_t  csp_mode;			//IN - true= CS Position Mode, false= CS Velocity Mode, is only recognized at Linuxcnc Startup
     bool       enable_edge;         //NA - used in write_homing_out_pins() to detect edge
     bool       old_enable_edge;
-    bool       pos_mode;
-    bool       init_pos_mode;
+    hal_bit_t   pos_mode;
+    int   init_pos_mode;
     // Auxilliary pins  
 	hal_bit_t  cia_opmode_no_mode;
 	hal_bit_t  cia_opmode_homing;
@@ -323,6 +324,7 @@ typedef struct {
 	//Debug Pins
 	hal_u32_t *dbgControlWord;
 	hal_u32_t *dbgStatusWord;	
+	hal_bit_t *pos_mode;
 	
 } one_joint_home_data_t;
 
@@ -413,11 +415,11 @@ static int makepins(int id,int njoints)
         retval += hal_pin_bit_newf(HAL_OUT, &(addr->stat_homing), id,
                                   "joint.%d.cia-stat-homing", jno);                                                                                                                    
 		retval += hal_pin_bit_newf(HAL_IN, &(addr->csp_mode), id,
-                                  "joint.%d.cia-csp-mode", jno);
+                                  "joint.%d.csp-mode", jno);
         retval += hal_pin_float_newf(HAL_IN, (volatile double **)&(addr->cia_pos_scale), id,
                                   "joint.%d.cia-pos-scale", jno);                                  
 		retval += hal_pin_bit_newf(HAL_OUT, &(addr->cia_opmode_no_mode), id,
-                                  "joint.%d.cia-pmode-no-mode", jno);
+                                  "joint.%d.cia-opmode-no-mode", jno);
 		retval += hal_pin_bit_newf(HAL_OUT, &(addr->cia_opmode_homing), id,
                                   "joint.%d.cia-opmode-homing", jno);
 		retval += hal_pin_bit_newf(HAL_OUT, &(addr->opmode_cyclic_position), id,
@@ -430,7 +432,8 @@ static int makepins(int id,int njoints)
                                   "joint.%d.cia-dbgControlWord", jno);                                  
        retval += hal_pin_u32_newf(HAL_OUT, &(addr->dbgStatusWord), id,
                                   "joint.%d.cia-dbgStatusWord", jno);   
- 
+       retval += hal_pin_bit_newf(HAL_OUT, &(addr->pos_mode), id,
+                                  "joint.%d.pos-mode", jno);
         
 
 	// Auxilliary pins  
@@ -576,6 +579,7 @@ int  homing_init(int id,
         H[i].home_sequence   =  1000; //startup: unrealizable, positive seq no.
         H[i].volatile_home   =  0;
         H[i].init_pos_mode   =  0;
+        H[i].csp_mode      =  1;
     }
     return 0;
 }
@@ -804,11 +808,11 @@ void write_homing_out_pins(int njoints)
 		//init opmode
 		if (!H[jno].init_pos_mode) {
 		  H[jno].pos_mode = H[jno].csp_mode;
-		  H[jno].init_pos_mode = 1;
+		  H[jno].init_pos_mode++;
 		}
 		
 		// detect enable edge
-		H[jno].enable_edge = H[jno].enable && !H[jno].old_enable_edge;
+		H[jno].enable_edge = H[jno].enable && !H[jno].old_enable_edge; 		
 		H[jno].old_enable_edge = H[jno].enable;
 		H[jno].Control.b.QuickStop = 1;  // Quickstop is not supported
 		if(H[jno].Status.b.Fault){
@@ -828,7 +832,7 @@ void write_homing_out_pins(int njoints)
 			  if (H[jno].Status.b.ReadyToSwitchOn) {
 				H[jno].Control.b.SwitchOn = 1;
 				if (H[jno].Status.b. SwitchOn) {
-				  H[jno].Control.b.EnableOperation;
+				  H[jno].Control.b.EnableOperation = 1;
 				}
 			  }
 			}
@@ -840,28 +844,53 @@ void write_homing_out_pins(int njoints)
         H[jno].drv_target_velocity = (int32_t) (H[jno].velocity_cmd * H[jno].cia_velo_scale);
         
         // reset home command 
-        //  TO DO
+        //  TO DO - Maybe not done here
+        /*
+        if (home && (stat_homed && !stat_homed_old) && opmode_homing) {
+		  home = 0;
+		}
+        stat_homed_old = stat_homed;  
+        */
+        
+	    // OP Mode 
+	    // set to position mode 
+ 	    if (H[jno].Status.b.VoltageEnabled && !H[jno].cia_home  ) {
+	   	  H[jno].opmode = OPMODE_CYCLIC_POSITION;
+	    }
+	    // set velo mode
+	    if (H[jno].Status.b.VoltageEnabled && !H[jno].pos_mode && !H[jno].cia_home) {
+		  H[jno].opmode = OPMODE_CYCLIC_VELOCITY;
+	    }
+	    
+	    /*
+	    // mode Home and start homing
+	    if (home) {
+		  opmode = OPMODE_HOMING;
+		  controlword |= (home << 4);  
+	    }
+        */
+        
         H[jno].tperiod += 1;  // dummy test DELETE ME
         addr = &(joint_home_data->jhd[jno]);
-        *(addr->homing)       = H[jno].homing;         // OUT
-        *(addr->homed)        = H[jno].homed;          // OUT
-        *(addr->home_state)   = H[jno].home_state;     // OUT
-        *(addr->index_enable) = H[jno].index_enable;   // IO
-	    *(addr->controlword) = H[jno].controlword;     // OUT
-	    H[jno].Control.Word = H[jno].controlword;      // Save status to bitmapped struct
-        *(addr->opmode) = H[jno].opmode;               // OUT
-        *(addr->cia_pos_fb) = H[jno].pos_fb;           // OUT                
-        *(addr->cia_velocity_fb) = H[jno].velocity_fb; // OUT                
+        *(addr->homing)       = H[jno].homing;          // OUT
+        *(addr->homed)        = H[jno].homed;           // OUT
+        *(addr->home_state)   = H[jno].home_state;      // OUT
+        *(addr->index_enable) = H[jno].index_enable;    // IO
+	    *(addr->controlword) = H[jno].Control.Word;     // OUT  
+        *(addr->opmode) = H[jno].opmode;                // OUT
+        *(addr->cia_pos_fb) = H[jno].pos_fb;            // OUT                
+        *(addr->cia_velocity_fb) = H[jno].velocity_fb;  // OUT                
         *(addr->drv_target_position) = H[jno].drv_target_position; // OUT                
-        *(addr->cia_pos_fb) = H[jno].pos_fb;           // OUT                
-        *(addr->cia_velocity_fb) = H[jno].velocity_fb; // OUT               
-        *(addr->cia_drv_fault) = H[jno].drv_fault;     // OUT  
-        *(addr->cia_home) = H[jno].cia_home; // OUT 
-        *(addr->stat_homed) = H[jno].stat_homed;       // OUT 
-        *(addr->stat_homing) = H[jno].stat_homing;     // OUT
-        *(addr->tperiod)      = H[jno].tperiod;        // OUT  - delete me for testing only
+        *(addr->cia_pos_fb) = H[jno].pos_fb;            // OUT                
+        *(addr->cia_velocity_fb) = H[jno].velocity_fb;  // OUT               
+        *(addr->cia_drv_fault) = H[jno].drv_fault;      // OUT  
+        *(addr->cia_home) = H[jno].cia_home;            // IO 
+        *(addr->stat_homed) = H[jno].stat_homed;        // OUT 
+        *(addr->stat_homing) = H[jno].stat_homing;      // OUT
+        *(addr->tperiod)      = H[jno].tperiod;         // OUT  - delete me for testing only
         *(addr->dbgControlWord)  = H[jno].Control.Word; // OUT - Debug, check it is working 
         *(addr->dbgStatusWord)  = H[jno].Status.Word;   // OUT - Debug, check it is working         
+        *(addr->csp_mode)  = H[jno].csp_mode;           // OUT - Debug, check it is working   
     }
     return;
 }
